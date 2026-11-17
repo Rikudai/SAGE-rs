@@ -1,0 +1,16 @@
+[package]
+name = "sage-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+regex.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true

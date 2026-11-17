@@ -1,0 +1,8 @@
+/target
+config/config.json
+config/config.json.bak
+config/*.tmp
+data/runs/
+data/quota.json
+logs/
+*.log

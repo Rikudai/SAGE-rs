@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/sage-core",
+    "crates/sage-providers",
+    "crates/sage-tools",
+    "crates/sage-voice",
+    "crates/sage-avatar",
+    "crates/sage-brain",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+sage-core = { path = "crates/sage-core" }
+sage-providers = { path = "crates/sage-providers" }
+sage-tools = { path = "crates/sage-tools" }
+sage-voice = { path = "crates/sage-voice" }
+sage-avatar = { path = "crates/sage-avatar" }
+sage-brain = { path = "crates/sage-brain" }
+
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+regex = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+eframe = "0.37"
+egui = "0.37"
+image = { version = "0.25", default-features = false, features = ["png"] }
+windows = { version = "0.62" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
