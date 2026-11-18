@@ -10,3 +10,4 @@ logs/
 data/legacy/
 /target-voice
 /target-*
+/sage.exe
