@@ -1,8 +1,9 @@
 //! `SpriteLibrary`: carrega quadros PNG sob demanda como texturas egui.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use egui::{ColorImage, Context, TextureHandle, TextureOptions};
 
@@ -15,7 +16,13 @@ pub struct SpriteLibrary {
     /// Contagem de quadros por diretório de escopo ("forms/slime", "clone") e animação.
     counts: RefCell<HashMap<String, HashMap<String, usize>>>,
     textures: RefCell<HashMap<(String, String, usize), Option<TextureHandle>>>,
+    /// Quadros já decodificados por uma thread de fundo, esperando virar textura.
+    decoded: Arc<Mutex<HashMap<Key, ColorImage>>>,
+    /// (escopo, animação) cuja decodificação em segundo plano já foi pedida.
+    requested: RefCell<HashSet<(String, String)>>,
 }
+
+type Key = (String, String, usize);
 
 fn scope_dir(scope: &str) -> String {
     if scope == "clone" { "clone".into() } else { format!("forms/{scope}") }
@@ -28,7 +35,14 @@ impl SpriteLibrary {
         let timing = std::fs::read_to_string(root.join("sprite_meta.json"))
             .map(|t| Timing::from_meta_json(&t))
             .unwrap_or_default();
-        Self { root, timing, counts: RefCell::default(), textures: RefCell::default() }
+        Self {
+            root,
+            timing,
+            counts: RefCell::default(),
+            textures: RefCell::default(),
+            decoded: Arc::default(),
+            requested: RefCell::default(),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -50,18 +64,60 @@ impl SpriteLibrary {
         out
     }
 
+    /// Decodifica em segundo plano todos os quadros de uma animação, para que ela não
+    /// trave o desenho lendo PNG do disco no meio do movimento. Barato se já pedido.
+    pub fn prefetch(&self, scope: &str, anim: &str) {
+        let req = (scope.to_string(), anim.to_string());
+        if self.requested.borrow().contains(&req) {
+            return;
+        }
+        self.requested.borrow_mut().insert(req);
+        let count = self.frame_count(scope, anim);
+        if count == 0 {
+            return;
+        }
+        let done: Vec<usize> = {
+            let t = self.textures.borrow();
+            (0..count).filter(|i| t.contains_key(&(scope.to_string(), anim.to_string(), *i))).collect()
+        };
+        let dir = self.root.join(scope_dir(scope));
+        let (scope, anim) = (scope.to_string(), anim.to_string());
+        let out = self.decoded.clone();
+        let spawned = std::thread::Builder::new().name("sage-sprites".into()).spawn(move || {
+            for idx in (0..count).filter(|i| !done.contains(i)) {
+                if let Ok(img) = load_image(&dir.join(format!("{anim}_{idx}.png")))
+                    && let Ok(mut m) = out.lock()
+                {
+                    m.insert((scope.clone(), anim.clone(), idx), img);
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("não consegui decodificar sprites em segundo plano: {e}");
+        }
+    }
+
+    fn take_decoded(&self, key: &Key) -> Option<ColorImage> {
+        self.decoded.lock().ok()?.remove(key)
+    }
+
     /// Texturas do quadro `idx` (carrega na primeira vez; falha de leitura é lembrada).
     pub fn texture(&self, ctx: &Context, scope: &str, anim: &str, idx: usize) -> Option<TextureHandle> {
         let key = (scope.to_string(), anim.to_string(), idx);
         if let Some(t) = self.textures.borrow().get(&key) {
             return t.clone();
         }
-        let path = self.root.join(scope_dir(scope)).join(format!("{anim}_{idx}.png"));
-        let tex = match load_image(&path) {
-            Ok(img) => Some(ctx.load_texture(format!("{scope}/{anim}_{idx}"), img, TextureOptions::LINEAR)),
-            Err(e) => {
-                tracing::warn!("sprite {}: {e}", path.display());
-                None
+        let name = format!("{scope}/{anim}_{idx}");
+        let tex = if let Some(img) = self.take_decoded(&key) {
+            Some(ctx.load_texture(name, img, TextureOptions::LINEAR))
+        } else {
+            let path = self.root.join(scope_dir(scope)).join(format!("{anim}_{idx}.png"));
+            match load_image(&path) {
+                Ok(img) => Some(ctx.load_texture(name, img, TextureOptions::LINEAR)),
+                Err(e) => {
+                    tracing::warn!("sprite {}: {e}", path.display());
+                    None
+                }
             }
         };
         self.textures.borrow_mut().insert(key, tex.clone());

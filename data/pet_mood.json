@@ -1,1 +1,6 @@
-{"affection": 0.78, "pets_total": 12, "saved_at": "2026-11-15 18:07:17"}
+{
+  "joy": 1.0,
+  "affection": 0.86,
+  "curiosity": 1.0,
+  "boredom": 1.0
+}

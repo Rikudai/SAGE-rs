@@ -16,17 +16,27 @@ pub fn parse_frame_name(file_name: &str) -> Option<(String, usize)> {
     Some((anim.to_string(), idx.parse().ok()?))
 }
 
-/// Tempos padrão de `FRAME_MS` / `ANIM_FRAME_MS` do slime antigo.
+/// Tempos de `FRAME_MS` do slime antigo (pixel_avatar.py), animação por animação.
 fn builtin_ms(anim: &str) -> u64 {
     match anim {
-        "idle" => 70,
-        "walk" => 55,
-        "run" => 45,
-        "talk" => 60,
-        "pensando" | "sabio" | "orquestrando" | "maestro" => 75,
+        "idle" | "confuso" | "orgulhoso" | "curioso" | "orgulhoso_clone" | "bolha" | "work" | "fail" => 70,
+        "walk" | "feliz" | "bravo" | "alerta" | "forjando" | "forjando_in" | "forjando_out" | "acenar"
+        | "predador" | "danca" | "done" => 55,
+        "run" | "medo" | "quicar" | "pouso" | "transform" => 45,
+        "talk" | "foto" | "apontar" | "olhar_esq" | "olhar_dir" | "olhar_cima" | "derreter" | "cafune"
+        | "piscadela" => 60,
+        "triste" => 85,
+        "pensando" | "orquestrando" | "envergonhado" | "bocejo" => 75,
         "dormindo" => 110,
-        "teleport" | "teleport_in" | "teleport_out" => 40,
-        "spawn" | "work" | "done" | "fail" | "vanish" => 60,
+        "surpreso" | "rindo" | "determinado" | "comemorando" | "orquestrando_in" | "orquestrando_out"
+        | "arrastado" | "morph_in" | "morph_out" | "spawn" | "vanish" => 50,
+        "amor" | "ouvindo" | "tonto" | "sabio" | "espreguicar" | "espiar" | "acordar" => 65,
+        "maestro" | "bronca_clone" => 62,
+        "entediado" => 95,
+        // Entrada e saída um pouco mais lentas que no app antigo (40 ms): com poucos
+        // quadros (9–11) a 40 ms o teletransporte parecia um "pisca".
+        "teleport_in" | "teleport_out" => 55,
+        "teleport" => 40,
         _ => DEFAULT_FRAME_MS,
     }
 }

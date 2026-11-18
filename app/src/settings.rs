@@ -29,24 +29,22 @@ impl SettingsPage {
     /// Desenha a página; devolve a config nova quando o usuário salva.
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Config> {
         let p = theme::palette(ui);
-        ui.label(theme::bold("Configurações").size(20.0));
+        ui.label(theme::bold("Configurações").size(theme::size::HEADING).color(p.text));
         ui.label(theme::muted(ui, "Tudo fica no config/config.json, o mesmo arquivo do SAGE antigo."));
-        ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            for (t, name) in [
+        ui.add_space(14.0);
+        theme::segmented(
+            ui,
+            "settings-tabs",
+            &mut self.tab,
+            &[
                 (Tab::Geral, "Geral"),
                 (Tab::Voz, "Voz"),
                 (Tab::Modelos, "Modelos e chaves"),
                 (Tab::Cerebro, "Cérebro"),
                 (Tab::Slime, "Slime"),
-            ] {
-                let kind = if self.tab == t { theme::Kind::Primary } else { theme::Kind::Secondary };
-                if theme::pill(ui, kind, name).clicked() {
-                    self.tab = t;
-                }
-            }
-        });
-        ui.add_space(8.0);
+            ],
+        );
+        ui.add_space(14.0);
         let (title, desc) = match self.tab {
             Tab::Geral => ("Geral", "Seu nome, atalhos globais e o que o S.A.G.E. pode fazer no PC."),
             Tab::Voz => ("Voz", "Como ele fala (Fish Audio, com Edge TTS de reserva) e como ele ouve você."),
@@ -54,12 +52,13 @@ impl SettingsPage {
             Tab::Cerebro => ("Cérebro", "O lead planeja e workers mais baratos executam. Ajuste perfil e limites."),
             Tab::Slime => ("Slime", "O avatar na área de trabalho."),
         };
-        let footer_h = 56.0;
+        let footer_h = 64.0;
         egui::ScrollArea::vertical().max_height(ui.available_height() - footer_h).auto_shrink(false).show(ui, |ui| {
-            theme::card(ui).show(ui, |ui| {
+            ui.set_max_width(860.0);
+            theme::card(ui).inner_margin(egui::Margin::same(22)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 theme::section(ui, title, desc);
-                egui::Grid::new("settings").num_columns(2).spacing([24.0, 10.0]).min_col_width(220.0).show(ui, |ui| {
+                egui::Grid::new("settings").num_columns(2).spacing([28.0, 14.0]).min_col_width(230.0).show(ui, |ui| {
                     match self.tab {
                         Tab::Geral => self.geral(ui),
                         Tab::Voz => self.voz(ui),
@@ -70,16 +69,20 @@ impl SettingsPage {
                 });
             });
             if self.tab == Tab::Modelos {
-                ui.add_space(10.0);
-                theme::card(ui).show(ui, |ui| {
+                ui.add_space(12.0);
+                theme::card(ui).inner_margin(egui::Margin::same(22)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     self.providers(ui);
                 });
             }
+            ui.add_space(8.0);
         });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         let mut saved = None;
+        ui.separator();
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
             if theme::primary(ui, "Salvar alterações").clicked() {
                 match self.draft.save(&paths::config_file()) {
                     Ok(()) => {
@@ -96,7 +99,8 @@ impl SettingsPage {
                 self.msg = "Alterações descartadas.".into();
             }
             if !self.msg.is_empty() {
-                ui.label(theme::muted(ui, self.msg.clone()));
+                let color = if self.msg.starts_with("Não") { p.err } else { p.muted };
+                ui.label(egui::RichText::new(self.msg.clone()).size(13.0).color(color));
             }
         });
         saved
@@ -105,17 +109,17 @@ impl SettingsPage {
     fn geral(&mut self, ui: &mut egui::Ui) {
         let d = &mut self.draft;
         let mut name = d.user_name.clone().unwrap_or_default();
-        ui.label("Seu nome");
+        field_label(ui, "Seu nome");
         if ui.text_edit_singleline(&mut name).changed() {
             d.user_name = Some(name).filter(|n| !n.trim().is_empty());
         }
         ui.end_row();
         check(ui, "Ações no PC (ferramentas)", &mut d.enable_actions);
         check(ui, "PowerShell liberado", &mut d.enable_shell_tools);
-        ui.label("Atalho: segurar para falar");
+        field_label(ui, "Atalho: segurar para falar");
         ui.text_edit_singleline(&mut d.hotkey_listen);
         ui.end_row();
-        ui.label("Atalho: abrir o chat");
+        field_label(ui, "Atalho: abrir o chat");
         ui.text_edit_singleline(&mut d.hotkey_panel);
         ui.end_row();
         check(ui, "Sons de evento", &mut d.enable_sfx);
@@ -136,7 +140,7 @@ impl SettingsPage {
         text(ui, "Edge TTS: tom", &mut d.voice_pitch);
         combo(ui, "Perfil de voz", &mut d.voice_profile, &["rimuru", "sabio", "classica"]);
         let mut wake = d.wake_words.join(", ");
-        ui.label("Palavras de ativação");
+        field_label(ui, "Palavras de ativação");
         if ui.text_edit_singleline(&mut wake).changed() {
             d.wake_words = wake.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         }
@@ -145,9 +149,7 @@ impl SettingsPage {
     }
 
     fn modelos(&mut self, ui: &mut egui::Ui) {
-        ui.label("Mostrar chaves");
-        ui.checkbox(&mut self.show_keys, "");
-        ui.end_row();
+        check(ui, "Mostrar chaves", &mut self.show_keys);
         let show = self.show_keys;
         let d = &mut self.draft;
         secret(ui, "Gemini (AI Studio): chave", &mut d.gemini_api_key, show);
@@ -177,7 +179,7 @@ impl SettingsPage {
                         text(ui, "Modelo", &mut p.model);
                         list(ui, "Modelos reserva", &mut p.fallback_models);
                         let mut url = p.base_url.clone().unwrap_or_default();
-                        ui.label("Base URL (opcional)");
+                        field_label(ui, "Base URL (opcional)");
                         if ui.text_edit_singleline(&mut url).changed() {
                             p.base_url = Some(url).filter(|u| !u.trim().is_empty());
                         }
@@ -193,7 +195,7 @@ impl SettingsPage {
         }
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.new_provider).hint_text("id do provedor, ex.: groq").desired_width(220.0));
-            if theme::button(ui, theme::Kind::Secondary, "+ Adicionar provedor").clicked() && !self.new_provider.trim().is_empty() {
+            if theme::icon_text_button(ui, theme::Kind::Secondary, theme::Icon::Plus, "Adicionar provedor").clicked() && !self.new_provider.trim().is_empty() {
                 self.draft
                     .cloud_providers
                     .insert(self.new_provider.trim().to_lowercase(), CloudProvider { enabled: true, ..Default::default() });
@@ -208,16 +210,16 @@ impl SettingsPage {
         combo(ui, "Perfil", &mut profile, &["base", "savings", "aggressive"]);
         d.brain_profile = Some(profile);
         let mut max_workers = d.brain_max_workers.unwrap_or(6);
-        ui.label("Máximo de workers por execução");
+        field_label(ui, "Máximo de workers por execução");
         ui.add(egui::DragValue::new(&mut max_workers).range(1..=12));
         d.brain_max_workers = Some(max_workers);
         ui.end_row();
         let mut cost = d.brain_max_cost_usd.unwrap_or(0.0);
-        ui.label("Teto de custo por execução (US$, 0 = sem teto)");
+        field_label(ui, "Teto de custo por execução (US$, 0 = sem teto)");
         ui.add(egui::DragValue::new(&mut cost).range(0.0..=50.0).speed(0.05));
         d.brain_max_cost_usd = Some(cost).filter(|c| *c > 0.0);
         ui.end_row();
-        ui.label("Playbooks");
+        field_label(ui, "Playbooks");
         if theme::button(ui, theme::Kind::Secondary, "Abrir playbooks.yaml").clicked() {
             let _ = std::process::Command::new("cmd")
                 .args(["/c", "start", "", &paths::playbooks_file().to_string_lossy()])
@@ -240,27 +242,32 @@ impl SettingsPage {
     }
 }
 
-fn check(ui: &mut egui::Ui, label: &str, v: &mut bool) {
-    ui.label(label);
-    ui.checkbox(v, "");
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    let p = theme::palette(ui);
+    ui.label(egui::RichText::new(text).color(p.muted));
+}
+
+fn check(ui: &mut egui::Ui, text: &str, v: &mut bool) {
+    field_label(ui, text);
+    theme::switch(ui, v, "").widget_info(|| egui::WidgetInfo::selected(egui::Role::CheckBox, true, *v, text));
     ui.end_row();
 }
 
 fn text(ui: &mut egui::Ui, label: &str, v: &mut String) {
-    ui.label(label);
+    field_label(ui, label);
     ui.add(egui::TextEdit::singleline(v).desired_width(360.0));
     ui.end_row();
 }
 
 fn secret(ui: &mut egui::Ui, label: &str, v: &mut String, show: bool) {
-    ui.label(label);
+    field_label(ui, label);
     ui.add(egui::TextEdit::singleline(v).password(!show).desired_width(360.0));
     ui.end_row();
 }
 
 fn list(ui: &mut egui::Ui, label: &str, v: &mut Vec<String>) {
     let mut s = v.join(", ");
-    ui.label(label);
+    field_label(ui, label);
     if ui.add(egui::TextEdit::singleline(&mut s).desired_width(360.0)).changed() {
         *v = s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
     }
@@ -268,7 +275,7 @@ fn list(ui: &mut egui::Ui, label: &str, v: &mut Vec<String>) {
 }
 
 fn combo(ui: &mut egui::Ui, label: &str, v: &mut String, options: &[&str]) {
-    ui.label(label);
+    field_label(ui, label);
     egui::ComboBox::from_id_salt(label).selected_text(v.clone()).show_ui(ui, |ui| {
         for o in options {
             ui.selectable_value(v, o.to_string(), *o);
@@ -279,7 +286,7 @@ fn combo(ui: &mut egui::Ui, label: &str, v: &mut String, options: &[&str]) {
 
 fn slider(ui: &mut egui::Ui, label: &str, v: &mut Option<f32>, range: std::ops::RangeInclusive<f32>, default: f32) {
     let mut x = v.unwrap_or(default);
-    ui.label(label);
+    field_label(ui, label);
     if ui.add(egui::Slider::new(&mut x, range)).changed() {
         *v = Some(x);
     }
@@ -287,7 +294,7 @@ fn slider(ui: &mut egui::Ui, label: &str, v: &mut Option<f32>, range: std::ops::
 }
 
 fn model_ref(ui: &mut egui::Ui, label: &str, m: &mut ModelRef) {
-    ui.label(label);
+    field_label(ui, label);
     ui.horizontal(|ui| {
         ui.add(egui::TextEdit::singleline(&mut m.provider).desired_width(90.0).hint_text("provedor"));
         ui.add(egui::TextEdit::singleline(&mut m.model).desired_width(260.0).hint_text("modelo"));

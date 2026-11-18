@@ -7,3 +7,6 @@ data/quota.json
 logs/
 *.log
 .alethe/
+data/legacy/
+/target-voice
+/target-*

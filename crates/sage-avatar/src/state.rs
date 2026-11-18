@@ -53,6 +53,18 @@ enum Morph {
     In,
 }
 
+/// Presença do slime na tela: entra com `teleport_in`, sai com `teleport_out`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// Fora da tela (a janela não deve ser desenhada).
+    Hidden,
+    /// Tocando `teleport_in`.
+    Entering,
+    Shown,
+    /// Tocando `teleport_out`; vira `Hidden` no último quadro.
+    Leaving,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Walk {
     pub run: bool,
@@ -78,6 +90,7 @@ pub struct Pet {
     sleeping: bool,
     sleep_after: f64,
     walk: Option<Walk>,
+    presence: Presence,
     anim: String,
     frame: usize,
     acc_ms: f64,
@@ -104,6 +117,7 @@ impl Pet {
             sleeping: false,
             sleep_after: sleep_after_secs.max(1) as f64,
             walk: None,
+            presence: Presence::Shown,
             anim: "idle".into(),
             frame: 0,
             acc_ms: 0.0,
@@ -129,6 +143,46 @@ impl Pet {
     }
     pub fn rng(&mut self) -> &mut Rng {
         &mut self.rng
+    }
+    pub fn presence(&self) -> Presence {
+        self.presence
+    }
+
+    /// Volta a animação atual ao quadro 0 (ex.: a janela ainda não apareceu).
+    pub fn restart_anim(&mut self) {
+        self.frame = 0;
+        self.acc_ms = 0.0;
+    }
+
+    /// Milissegundos até o próximo quadro da animação atual.
+    pub fn ms_to_next_frame(&self) -> f64 {
+        (self.timing.frame_ms(&self.anim) as f64 - self.acc_ms).max(0.0)
+    }
+
+    /// Começa fora da tela (o primeiro `appear` toca a entrada).
+    pub fn start_hidden(&mut self) {
+        self.presence = Presence::Hidden;
+    }
+
+    /// Entra na tela com `teleport_in` (também interrompe uma saída em andamento).
+    pub fn appear(&mut self, now: f64) {
+        if matches!(self.presence, Presence::Hidden | Presence::Leaving) {
+            self.presence = Presence::Entering;
+            self.walk = None;
+            self.dragging = false;
+            self.landing = false;
+            self.oneshot = None;
+            self.touch(now);
+        }
+    }
+
+    /// Sai da tela com `teleport_out`; `presence()` vira `Hidden` quando termina.
+    pub fn vanish(&mut self) {
+        if matches!(self.presence, Presence::Shown | Presence::Entering) {
+            self.presence = Presence::Leaving;
+            self.walk = None;
+            self.dragging = false;
+        }
     }
 
     fn touch(&mut self, now: f64) {
@@ -230,6 +284,11 @@ impl Pet {
 
     /// Animação desejada agora, por prioridade.
     pub fn desired_anim(&self, now: f64) -> String {
+        match self.presence {
+            Presence::Entering => return "teleport_in".into(),
+            Presence::Leaving | Presence::Hidden => return "teleport_out".into(),
+            Presence::Shown => {}
+        }
         if let Some(m) = self.morph {
             return match m {
                 Morph::Out => "morph_out",
@@ -281,6 +340,59 @@ impl Pet {
             self.walk = None;
         }
 
+        if self.presence == Presence::Hidden {
+            return;
+        }
+        self.sync_anim(now, info);
+        let mut count = info.frame_count(&self.form, &self.anim);
+        if count == 0 {
+            return;
+        }
+        // Avanço por tempo: quantos quadros couberam em `dt`, sem pular o fim de uma
+        // animação avulsa (ela termina e a próxima começa no mesmo tick, do quadro 0).
+        self.acc_ms += dt * 1000.0;
+        let mut step = self.timing.frame_ms(&self.anim) as f64;
+        while self.acc_ms >= step {
+            self.acc_ms -= step;
+            if self.frame + 1 < count {
+                self.frame += 1;
+                continue;
+            }
+            if is_looping(&self.anim) {
+                self.frame = 0;
+                continue;
+            }
+            // Último quadro de uma animação que toca uma vez.
+            self.finish_oneshot();
+            if self.presence == Presence::Hidden {
+                self.acc_ms = 0.0;
+                return;
+            }
+            let leftover = self.acc_ms;
+            self.sync_anim(now, info);
+            count = info.frame_count(&self.form, &self.anim);
+            if count == 0 {
+                return;
+            }
+            self.acc_ms = leftover.min(step);
+            step = self.timing.frame_ms(&self.anim) as f64;
+        }
+    }
+
+    /// Troca para a animação desejada (do quadro 0) se ela mudou.
+    fn sync_anim(&mut self, now: f64, info: &dyn FrameInfo) {
+        let want = self.desired_anim(now);
+        if info.frame_count(&self.form, &want) == 0 {
+            // Entrada/saída sem arquivos: conclui na hora em vez de travar.
+            match self.presence {
+                Presence::Entering => self.presence = Presence::Shown,
+                Presence::Leaving => {
+                    self.presence = Presence::Hidden;
+                    return;
+                }
+                _ => {}
+            }
+        }
         let want = self.desired_anim(now);
         // Animação sem arquivos: cai para idle em vez de travar o estado.
         let want = if info.frame_count(&self.form, &want) == 0 { "idle".to_string() } else { want };
@@ -289,29 +401,23 @@ impl Pet {
             self.frame = 0;
             self.acc_ms = 0.0;
         }
-
-        let count = info.frame_count(&self.form, &self.anim);
-        if count == 0 {
-            return;
-        }
-        self.acc_ms += dt * 1000.0;
-        let step = self.timing.frame_ms(&self.anim) as f64;
-        while self.acc_ms >= step {
-            self.acc_ms -= step;
-            self.frame += 1;
-            if self.frame >= count {
-                if is_looping(&self.anim) {
-                    self.frame = 0;
-                } else {
-                    self.frame = count.saturating_sub(1);
-                    self.finish_oneshot();
-                    break;
-                }
-            }
-        }
     }
 
     fn finish_oneshot(&mut self) {
+        match self.presence {
+            Presence::Entering => {
+                self.presence = Presence::Shown;
+                self.frame = 0;
+                self.acc_ms = 0.0;
+                return;
+            }
+            Presence::Leaving => {
+                // Fica no último quadro (vazio) até a janela ser fechada.
+                self.presence = Presence::Hidden;
+                return;
+            }
+            _ => {}
+        }
         match self.morph {
             Some(Morph::Out) => {
                 if let Some(f) = self.pending_form.take() {
@@ -593,6 +699,77 @@ mod tests {
             }
         }
         assert_eq!(c.phase, ClonePhase::Fail);
+    }
+
+    #[test]
+    fn enters_and_leaves_with_teleport() {
+        let mut p = pet();
+        p.start_hidden();
+        assert_eq!(p.presence(), Presence::Hidden);
+        p.appear(0.0);
+        p.tick(0.0, 0.0, &info);
+        assert_eq!(p.anim(), "teleport_in");
+        // 3 quadros de 55 ms: termina e já começa o idle no mesmo tick.
+        p.tick(0.17, 0.17, &info);
+        assert_eq!(p.presence(), Presence::Shown);
+        assert_eq!(p.anim(), "idle");
+        p.vanish();
+        p.tick(0.0, 0.2, &info);
+        assert_eq!(p.anim(), "teleport_out");
+        p.tick(0.06, 0.26, &info);
+        assert_eq!(p.presence(), Presence::Leaving);
+        p.tick(0.2, 0.46, &info);
+        assert_eq!(p.presence(), Presence::Hidden);
+        // Volta durante a saída: entra de novo.
+        p.appear(1.0);
+        assert_eq!(p.presence(), Presence::Entering);
+    }
+
+    #[test]
+    fn missing_teleport_frames_do_not_block() {
+        let none = |_: &str, anim: &str| if anim.starts_with("teleport") { 0usize } else { 3 };
+        let mut p = pet();
+        p.start_hidden();
+        p.appear(0.0);
+        p.tick(0.016, 0.016, &none);
+        assert_eq!(p.presence(), Presence::Shown);
+        p.vanish();
+        p.tick(0.016, 0.032, &none);
+        assert_eq!(p.presence(), Presence::Hidden);
+    }
+
+    #[test]
+    fn oneshot_end_never_flashes_its_first_frame() {
+        let mut p = pet();
+        p.tick(0.0, 0.0, &info);
+        p.play_once("acenar");
+        p.tick(0.0, 0.0, &info);
+        assert_eq!(p.anim(), "acenar");
+        let mut t = 0.0;
+        let mut seen = vec![];
+        for _ in 0..40 {
+            t += 0.016;
+            p.tick(0.016, t, &info);
+            seen.push((p.anim().to_string(), p.frame()));
+        }
+        // Depois do último quadro de "acenar" (2), nunca volta ao quadro 0 de "acenar".
+        let last = seen.iter().position(|(a, f)| a == "acenar" && *f == 2).unwrap();
+        assert!(seen[last..].iter().all(|(a, f)| !(a == "acenar" && *f == 0)));
+        assert_eq!(p.anim(), "idle");
+    }
+
+    #[test]
+    fn frame_advance_is_time_based() {
+        // 70 ms por quadro de idle: 1 s a 60 Hz ou a 30 Hz dá o mesmo quadro.
+        let mut a = pet();
+        let mut b = pet();
+        for i in 0..60 {
+            a.tick(1.0 / 60.0, i as f64 / 60.0, &info);
+        }
+        for i in 0..30 {
+            b.tick(1.0 / 30.0, i as f64 / 30.0, &info);
+        }
+        assert_eq!(a.frame(), b.frame());
     }
 
     #[test]
