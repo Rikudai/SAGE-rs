@@ -20,4 +20,13 @@ eframe.workspace = true
 egui.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
+image.workspace = true
+tray-icon = "0.21"
+global-hotkey = "0.7"
+egui_commonmark = "0.26"
+
+[build-dependencies]
+embed-resource = "3"

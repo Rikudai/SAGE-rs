@@ -6,6 +6,7 @@ pub mod anim;
 pub mod brain;
 pub mod sprites;
 pub mod state;
+mod chrome;
 mod view;
 
 pub use view::PetView;

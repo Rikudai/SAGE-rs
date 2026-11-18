@@ -37,11 +37,16 @@ pub struct PetView {
     home: Option<Pos2>,
     initial_pos: Option<Pos2>,
     dragging: bool,
+    /// Pixels por ponto do monitor (1 pixel do sprite = 1 pixel da tela, como no SAGE antigo).
+    ppp: f32,
+    /// Tentativas restantes de tirar a borda/sombra do Windows 11 da janela do slime.
+    chrome_tries: u32,
+    chrome_last: f64,
 }
 
 impl PetView {
     pub fn new(_ctx: &Context, cfg: &Config) -> Self {
-        Self::with_dirs(cfg, PathBuf::from("assets/sprites"), PathBuf::from("data/pet_mood.json"))
+        Self::with_dirs(cfg, sage_core::paths::assets().join("sprites"), sage_core::paths::data().join("pet_mood.json"))
     }
 
     /// Variante com pastas explícitas (exemplo e testes).
@@ -70,6 +75,9 @@ impl PetView {
             start: Instant::now(),
             last: 0.0,
             scale: cfg.pet_scale.unwrap_or(1.0).clamp(0.5, 2.0),
+            ppp: 1.0,
+            chrome_tries: 120,
+            chrome_last: 0.0,
             opacity: cfg.pet_opacity.unwrap_or(1.0).clamp(0.1, 1.0),
             leash: cfg.pet_leash_radius.unwrap_or(260.0).max(0.0),
             mood_path,
@@ -87,7 +95,7 @@ impl PetView {
 
     /// Escala em pixels por pixel de quadro: o quadro em disco é 2x o tamanho lógico.
     fn px(&self) -> f32 {
-        self.scale * 0.5
+        self.scale / self.ppp.max(0.5)
     }
 
     /// Janela: slime à esquerda e uma faixa à direita para os clones.
@@ -165,6 +173,7 @@ impl PetView {
 
     /// Abre/atualiza a janela do slime e desenha o quadro atual.
     pub fn show(&mut self, ctx: &Context) {
+        self.ppp = ctx.pixels_per_point();
         let now = self.now();
         self.advance(now);
         let size = self.window_size();
@@ -180,6 +189,7 @@ impl PetView {
             .with_title("S.A.G.E. slime")
             .with_transparent(true)
             .with_decorations(false)
+            .with_has_shadow(false)
             .with_always_on_top()
             .with_taskbar(false)
             .with_resizable(false)
@@ -190,6 +200,13 @@ impl PetView {
 
         if let Some(np) = self.walk_step(self.pet_dt()) {
             ctx.send_viewport_cmd_to(ViewportId::from_hash_of("sage-pet"), ViewportCommand::OuterPosition(np));
+        }
+
+        // O winit reaplica o estilo da janela nos primeiros quadros; repete por ~4 s
+        // e depois a cada ~2 s (barato) para a borda do Windows 11 não voltar.
+        self.chrome_tries = self.chrome_tries.saturating_sub(1);
+        if self.chrome_tries > 0 || self.chrome_tick() {
+            crate::chrome::strip("S.A.G.E. slime");
         }
 
         let mut petted = false;
@@ -225,6 +242,16 @@ impl PetView {
             self.home = self.pos;
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+
+    fn chrome_tick(&mut self) -> bool {
+        let now = self.now();
+        if now - self.chrome_last > 2.0 {
+            self.chrome_last = now;
+            true
+        } else {
+            false
+        }
     }
 
     fn pet_dt(&self) -> f64 {
