@@ -1,5 +1,6 @@
 //! `PetView`: janela própria (viewport imediato transparente) que desenha o slime e os clones.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -19,6 +20,31 @@ const FRAME_H: f32 = 216.0;
 const CLONE_W: f32 = 128.0;
 const CLONE_H: f32 = 116.0;
 const MAX_CLONES: usize = 6;
+/// Folga em volta do slime dentro da janela, para o achatar/esticar não ser cortado.
+const PAD: f32 = 14.0;
+
+/// Mola amortecida para o "corpo de gelatina" (achatar, esticar, inclinar).
+#[derive(Default, Clone, Copy)]
+struct Spring {
+    x: f32,
+    v: f32,
+}
+
+impl Spring {
+    fn step(&mut self, target: f32, stiffness: f32, damping: f32, dt: f32) {
+        // Sub-passos: estável mesmo com quadros longos.
+        let n = ((dt / 0.004).ceil() as usize).clamp(1, 16);
+        let h = dt / n as f32;
+        for _ in 0..n {
+            let a = stiffness * (target - self.x) - damping * self.v;
+            self.v += a * h;
+            self.x += self.v * h;
+        }
+    }
+    fn settled(&self, target: f32) -> bool {
+        (self.x - target).abs() < 0.002 && self.v.abs() < 0.01
+    }
+}
 
 pub struct PetView {
     lib: SpriteLibrary,
@@ -50,6 +76,16 @@ pub struct PetView {
     /// Medição de quadros por segundo (log em nível debug).
     fps_frames: u32,
     fps_since: f64,
+    /// Arrasto próprio (sem o laço modal do Windows, que congelava a animação):
+    /// distância do cursor ao canto da janela, em pontos.
+    grab: Option<Vec2>,
+    /// Botão pressionado sobre o slime (ainda sem arrastar) e mouse por cima.
+    pressed: bool,
+    hovered: bool,
+    squash: Spring,
+    tilt: Spring,
+    /// Último quadro desenhado: repetido enquanto o próximo ainda decodifica.
+    last_tex: RefCell<Option<egui::TextureHandle>>,
 }
 
 impl PetView {
@@ -71,6 +107,10 @@ impl PetView {
         pet.start_hidden();
         lib.prefetch(&pet.form, "teleport_in");
         lib.prefetch(&pet.form, "idle");
+        // Animações das interações: prontas antes do primeiro clique/arrasto.
+        for a in ["arrastado", "pouso", "feliz", "walk"] {
+            lib.prefetch(&pet.form, a);
+        }
         let brain = PetBrain::new(
             Mood::load(&mood_path),
             &cfg.pet_personality,
@@ -94,6 +134,12 @@ impl PetView {
             window_frames: 0,
             fps_frames: 0,
             fps_since: 0.0,
+            grab: None,
+            pressed: false,
+            hovered: false,
+            squash: Spring::default(),
+            tilt: Spring::default(),
+            last_tex: RefCell::new(None),
             opacity: cfg.pet_opacity.unwrap_or(1.0).clamp(0.1, 1.0),
             leash: cfg.pet_leash_radius.unwrap_or(260.0).max(0.0),
             mood_path,
@@ -102,6 +148,24 @@ impl PetView {
             home: None,
             initial_pos: None,
             dragging: false,
+        }
+    }
+
+    /// Aplica as configurações do slime na hora (tamanho, opacidade, forma, personalidade).
+    pub fn apply_config(&mut self, cfg: &Config) {
+        self.scale = cfg.pet_scale.unwrap_or(1.0).clamp(0.5, 2.0);
+        self.opacity = cfg.pet_opacity.unwrap_or(1.0).clamp(0.1, 1.0);
+        self.leash = cfg.pet_leash_radius.unwrap_or(260.0).max(0.0);
+        self.brain.configure(&cfg.pet_personality, cfg.pet_activity.unwrap_or(0.5), cfg.pet_free_will, cfg.enable_pet_walking);
+        if !cfg.enable_pet_walking {
+            self.pet.set_walk(None);
+        }
+        self.pet.set_sleep_after(cfg.pet_sleep_after_seconds.unwrap_or(300));
+        if !cfg.pet_form.is_empty() && cfg.pet_form != self.pet.form {
+            for a in ["morph_out", "morph_in", "idle"] {
+                self.lib.prefetch(&cfg.pet_form, a);
+            }
+            self.pet.change_form(&cfg.pet_form);
         }
     }
 
@@ -117,7 +181,28 @@ impl PetView {
     /// Janela: slime à esquerda e uma faixa à direita para os clones.
     fn window_size(&self) -> Vec2 {
         let p = self.px();
-        Vec2::new((FRAME_W + CLONE_W * 0.5 + 8.0) * p, FRAME_H * p)
+        Vec2::new((FRAME_W + CLONE_W * 0.5 + 8.0 + PAD * 2.0) * p, (FRAME_H + PAD * 2.0) * p)
+    }
+
+    /// Área útil do monitor onde o slime está, em pontos (sem a barra de tarefas).
+    fn work_area(&self, ctx: &Context, at: Option<Pos2>) -> Rect {
+        let ppp = self.ppp.max(0.5);
+        let probe = at.map(|p| p + self.window_size() * 0.5).unwrap_or(Pos2::new(1.0, 1.0));
+        if let Some([l, t, r, b]) = crate::chrome::work_area_px(probe.x * ppp, probe.y * ppp) {
+            return Rect::from_min_max(Pos2::new(l / ppp, t / ppp), Pos2::new(r / ppp, b / ppp));
+        }
+        let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(Vec2::new(1920.0, 1080.0));
+        Rect::from_min_size(Pos2::ZERO, Vec2::new(monitor.x, monitor.y - 48.0))
+    }
+
+    /// Mantém a janela inteira dentro da área útil do monitor.
+    fn clamp_to_screen(&self, ctx: &Context, p: Pos2) -> Pos2 {
+        let wa = self.work_area(ctx, Some(p));
+        let size = self.window_size();
+        // O quadro tem folga transparente embaixo: deixa encostar na barra de tarefas.
+        let foot = (PAD + 18.0) * self.px();
+        let max = Pos2::new((wa.right() - size.x).max(wa.left()), (wa.bottom() - size.y + foot).max(wa.top()));
+        Pos2::new(p.x.clamp(wa.left(), max.x), p.y.clamp(wa.top(), max.y))
     }
 
     /// Liga/desliga o slime. Ao ligar ele entra com `teleport_in`; ao desligar sai com
@@ -190,13 +275,15 @@ impl PetView {
     }
 
     /// Anda um passo dentro da coleira; devolve a nova posição se mudou.
-    fn walk_step(&mut self, dt: f64) -> Option<Pos2> {
+    fn walk_step(&mut self, ctx: &Context, dt: f64) -> Option<Pos2> {
         let w = self.pet.walking()?;
         let (pos, home) = (self.pos?, self.home?);
         let speed = if w.run { 4.6 } else { 2.6 } * 60.0 * dt as f32;
         let mut x = pos.x + w.dir * speed;
-        let lo = home.x - self.leash;
-        let hi = home.x + self.leash;
+        let wa = self.work_area(ctx, Some(pos));
+        let right = (wa.right() - self.window_size().x).max(wa.left());
+        let lo = (home.x - self.leash).max(wa.left());
+        let hi = (home.x + self.leash).min(right).max(lo);
         if x <= lo || x >= hi {
             x = x.clamp(lo, hi);
             self.pet.set_walk(None);
@@ -240,11 +327,22 @@ impl PetView {
         let size = self.window_size();
 
         if self.initial_pos.is_none() {
-            let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(Vec2::new(1920.0, 1080.0));
-            let p = Pos2::new((monitor.x - size.x - 40.0).max(0.0), (monitor.y - size.y - 60.0).max(0.0));
+            let wa = self.work_area(ctx, None);
+            let p = self.clamp_to_screen(ctx, Pos2::new(wa.right() - size.x - 40.0, wa.bottom() - size.y));
             self.initial_pos = Some(p);
             self.pos = Some(p);
             self.home = Some(p);
+        } else if !self.dragging
+            && let Some(p) = self.pos
+        {
+            // Tamanho/monitor mudou ou ele já estava fora: volta para dentro da tela.
+            let c = self.clamp_to_screen(ctx, p);
+            if (c - p).length() > 0.5 {
+                self.pos = Some(c);
+                self.home = self.home.map(|h| self.clamp_to_screen(ctx, h));
+                self.pet.set_walk(None);
+                ctx.send_viewport_cmd_to(ViewportId::from_hash_of("sage-pet"), ViewportCommand::OuterPosition(c));
+            }
         }
         let mut builder = ViewportBuilder::default()
             .with_title("S.A.G.E. slime")
@@ -260,9 +358,13 @@ impl PetView {
             builder = builder.with_position(p);
         }
 
-        if let Some(np) = self.walk_step(dt) {
+        if !self.dragging
+            && let Some(np) = self.walk_step(ctx, dt)
+        {
             ctx.send_viewport_cmd_to(ViewportId::from_hash_of("sage-pet"), ViewportCommand::OuterPosition(np));
         }
+        self.drag_step(ctx, dt as f32);
+        self.physics(dt as f32);
 
         // O winit reaplica o estilo da janela nos primeiros quadros; repete por um tempo
         // e depois a cada ~2 s (barato) para a borda do Windows 11 não voltar.
@@ -281,39 +383,106 @@ impl PetView {
         }
 
         let mut petted = false;
+        let mut tapped = false;
         let mut drag_started = false;
-        let mut drag_stopped = false;
-        let mut outer: Option<Pos2> = None;
+        let mut press = None;
+        let mut hover = false;
 
         self.draw(ctx, builder, &mut |ev| match ev {
             UiEvent::Petted => petted = true,
+            UiEvent::Tapped => tapped = true,
             UiEvent::DragStart => drag_started = true,
-            UiEvent::DragStop => drag_stopped = true,
-            UiEvent::Moved(p) => outer = Some(p),
+            UiEvent::Press(down) => press = Some(down),
+            UiEvent::Hover(h) => hover = h,
         });
+        self.hovered = hover;
+        if let Some(down) = press {
+            if down && !self.pressed {
+                // Toque: afunda na hora, antes de qualquer troca de animação.
+                self.squash.v += 4.0;
+            }
+            self.pressed = down;
+        }
 
         let shown = self.pet.presence() == Presence::Shown;
         if petted && shown {
             self.pet.pet(now);
             self.brain.on_event(&BrainEvent::Petted);
+            self.squash.v -= 7.0;
+        } else if tapped && shown {
+            // Clique simples: tremidinha de gelatina.
+            self.squash.v -= 5.0;
         }
-        if drag_started && shown {
-            self.dragging = true;
-            self.pet.begin_drag(now);
-            self.brain.on_event(&BrainEvent::DragStart);
-        }
-        if self.dragging
-            && let Some(p) = outer
-        {
-            self.pos = Some(p);
-        }
-        if drag_stopped && self.dragging {
-            self.dragging = false;
-            self.pet.end_drag(now);
-            self.brain.on_event(&BrainEvent::Drop);
-            self.home = self.pos;
+        if drag_started && shown && !self.dragging {
+            let ppp = self.ppp.max(0.5);
+            if let (Some((cx, cy)), Some(pos)) = (crate::chrome::cursor_px(), self.pos) {
+                self.grab = Some(Pos2::new(cx / ppp, cy / ppp) - pos);
+                self.dragging = true;
+                self.pet.begin_drag(now);
+                self.brain.on_event(&BrainEvent::DragStart);
+            }
         }
         self.schedule_repaint(ctx, now);
+    }
+
+    /// Segue o cursor enquanto o botão está pressionado; solta quando ele é liberado.
+    fn drag_step(&mut self, ctx: &Context, dt: f32) {
+        if !self.dragging {
+            return;
+        }
+        let ppp = self.ppp.max(0.5);
+        let down = crate::chrome::left_button_down().unwrap_or(self.pressed);
+        let (Some(grab), Some((cx, cy)), Some(pos)) = (self.grab, crate::chrome::cursor_px(), self.pos) else {
+            self.drop_pet();
+            return;
+        };
+        let target = self.clamp_to_screen(ctx, Pos2::new(cx / ppp, cy / ppp) - grab);
+        if (target - pos).length() > 0.1 {
+            ctx.send_viewport_cmd_to(ViewportId::from_hash_of("sage-pet"), ViewportCommand::OuterPosition(target));
+        }
+        // Balança para o lado oposto ao movimento (como gelatina pendurada).
+        let vx = if dt > 0.0 { (target.x - pos.x) / dt } else { 0.0 };
+        self.tilt.v += (-vx * 0.00035).clamp(-0.6, 0.6);
+        self.pos = Some(target);
+        if !down {
+            self.drop_pet();
+        }
+    }
+
+    fn drop_pet(&mut self) {
+        let now = self.now();
+        self.dragging = false;
+        self.grab = None;
+        self.pressed = false;
+        self.pet.end_drag(now);
+        self.brain.on_event(&BrainEvent::Drop);
+        self.home = self.pos;
+        // Aterrissa: achata e quica de volta.
+        self.squash.v += 9.0;
+    }
+
+    fn squash_target(&self) -> f32 {
+        if self.dragging {
+            -0.35 // pendurado: estica para baixo
+        } else if self.pressed {
+            0.55 // apertado: afunda
+        } else if self.hovered {
+            -0.06 // mouse em cima: "respira" para cima
+        } else {
+            0.0
+        }
+    }
+
+    fn physics(&mut self, dt: f32) {
+        let t = self.squash_target();
+        self.squash.step(t, 260.0, 11.0, dt);
+        self.squash.x = self.squash.x.clamp(-0.8, 1.2);
+        self.tilt.step(0.0, 140.0, 7.0, dt);
+        self.tilt.x = self.tilt.x.clamp(-0.35, 0.35);
+    }
+
+    fn springs_moving(&self) -> bool {
+        !self.squash.settled(self.squash_target()) || !self.tilt.settled(0.0)
     }
 
     /// Repinta no ritmo do monitor quando há movimento contínuo (andar, arrastar,
@@ -326,6 +495,8 @@ impl PetView {
             self.fps_since = now;
         }
         let moving = self.dragging
+            || self.pressed
+            || self.springs_moving()
             || self.pet.walking().is_some()
             || !self.clones.is_empty()
             || matches!(self.pet.presence(), Presence::Entering | Presence::Leaving);
@@ -363,14 +534,37 @@ impl PetView {
             egui::CentralPanel::default().frame(frame).show(vctx, |ui| {
                 let p = self.px();
                 let full = ui.max_rect();
-                let slime_rect = Rect::from_min_size(full.min, Vec2::new(FRAME_W * p, FRAME_H * p));
+                let slime_rect =
+                    Rect::from_min_size(full.min + Vec2::splat(PAD * p), Vec2::new(FRAME_W * p, FRAME_H * p));
                 let tint = Color32::from_white_alpha((self.opacity * 255.0) as u8);
 
-                if let Some(tex) = self.lib.texture(&ui.ctx().clone(), &self.pet.form, self.pet.anim(), self.pet.frame()) {
+                let tex = self.lib.texture(&ui.ctx().clone(), &self.pet.form, self.pet.anim(), self.pet.frame());
+                let tex = match tex {
+                    Some(t) => {
+                        *self.last_tex.borrow_mut() = Some(t.clone());
+                        Some(t)
+                    }
+                    None => self.last_tex.borrow().clone(),
+                };
+                if let Some(tex) = tex {
                     let flip = self.pet.walking().is_some_and(|w| w.dir < 0.0);
                     let (u0, u1) = if flip { (1.0, 0.0) } else { (0.0, 1.0) };
                     let uv = Rect::from_min_max(Pos2::new(u0, 0.0), Pos2::new(u1, 1.0));
-                    ui.painter().image(tex.id(), slime_rect, uv, tint);
+                    // Gelatina: achata/estica mantendo o "pé" no chão e inclina a partir do topo.
+                    let sq = self.squash.x;
+                    let (sx, sy) = (1.0 + 0.12 * sq, 1.0 - 0.14 * sq);
+                    let foot = Pos2::new(slime_rect.center().x, slime_rect.bottom() - 30.0 * p);
+                    let hinge = Pos2::new(slime_rect.center().x, slime_rect.top() + 40.0 * p);
+                    let (sin, cos) = self.tilt.x.sin_cos();
+                    let mut mesh = egui::epaint::Mesh::with_texture(tex.id());
+                    mesh.add_rect_with_uv(slime_rect, uv, tint);
+                    for v in &mut mesh.vertices {
+                        let d = v.pos - foot;
+                        let q = foot + Vec2::new(d.x * sx, d.y * sy);
+                        let r = q - hinge;
+                        v.pos = hinge + Vec2::new(r.x * cos - r.y * sin, r.x * sin + r.y * cos);
+                    }
+                    ui.painter().add(egui::Shape::mesh(mesh));
                 }
 
                 // Clones em coluna à direita, metade do tamanho de disco * escala.
@@ -378,7 +572,7 @@ impl PetView {
                 let ch = CLONE_H * 0.5 * p;
                 for (i, c) in self.clones.iter().enumerate() {
                     let row = i as f32;
-                    let min = Pos2::new(slime_rect.right() + 4.0 * p, full.min.y + row * ch * 0.8);
+                    let min = Pos2::new(slime_rect.right() + 4.0 * p, slime_rect.min.y + row * ch * 0.8);
                     let r = Rect::from_min_size(min, Vec2::new(cw, ch));
                     if let Some(tex) = self.lib.texture(&ui.ctx().clone(), "clone", c.phase.anim(), c.frame) {
                         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
@@ -386,21 +580,25 @@ impl PetView {
                     }
                 }
 
-                let resp = ui.interact(slime_rect, egui::Id::new("sage-pet-body"), Sense::click_and_drag());
+                // Área de toque: o corpo do slime (sem a folga transparente das bordas).
+                let body = slime_rect.shrink2(Vec2::new(40.0 * p, 30.0 * p));
+                let resp = ui.interact(body, egui::Id::new("sage-pet-body"), Sense::click_and_drag());
+                emit(UiEvent::Hover(resp.hovered() || self.dragging));
+                if resp.hovered() || self.dragging {
+                    ui.ctx().set_cursor_icon(if self.dragging { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+                }
                 if resp.double_clicked() {
                     emit(UiEvent::Petted);
+                } else if resp.clicked() {
+                    emit(UiEvent::Tapped);
+                }
+                if resp.is_pointer_button_down_on() {
+                    emit(UiEvent::Press(true));
+                } else if !self.dragging {
+                    emit(UiEvent::Press(false));
                 }
                 if resp.drag_started_by(egui::PointerButton::Primary) {
-                    ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
                     emit(UiEvent::DragStart);
-                }
-                let (any_down, outer) =
-                    ui.ctx().input(|i| (i.pointer.any_down(), i.viewport().outer_rect.map(|r| r.min)));
-                if let Some(o) = outer {
-                    emit(UiEvent::Moved(o));
-                }
-                if self.dragging && !any_down {
-                    emit(UiEvent::DragStop);
                 }
             });
         });
@@ -409,7 +607,8 @@ impl PetView {
 
 enum UiEvent {
     Petted,
+    Tapped,
     DragStart,
-    DragStop,
-    Moved(Pos2),
+    Press(bool),
+    Hover(bool),
 }

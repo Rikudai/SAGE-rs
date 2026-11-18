@@ -7,6 +7,7 @@ mod settings;
 mod theme;
 mod tray;
 mod ui;
+mod usage;
 
 use anyhow::Result;
 use sage_core::{paths, Config};
@@ -49,8 +50,10 @@ fn main() -> Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("S.A.G.E.")
-        .with_inner_size([980.0, 680.0])
-        .with_min_inner_size([560.0, 420.0]);
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([560.0, 420.0])
+        // Abre maximizado de verdade (ocupando a área útil da tela).
+        .with_maximized(true);
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
     }

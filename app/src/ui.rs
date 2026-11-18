@@ -17,6 +17,7 @@ use tokio::sync::broadcast;
 enum Page {
     Chat,
     Runs,
+    Usage,
     Settings,
 }
 
@@ -24,6 +25,22 @@ struct ChatLine {
     from_user: bool,
     text: String,
     when: String,
+}
+
+/// Uma tarefa orquestrada no painel lateral (acordeão com os workers dentro).
+struct TaskCard {
+    run_id: String,
+    title: String,
+    playbook: String,
+    why: String,
+    when: String,
+    started: std::time::Instant,
+    workers: BTreeMap<String, WorkerCard>,
+    /// Raciocínio ao vivo do lead nesta tarefa.
+    live: String,
+    /// Resumo final e custo quando o relatório sai.
+    done: Option<(String, Option<f64>, u64)>,
+    elapsed: Option<u64>,
 }
 
 #[derive(Default)]
@@ -36,6 +53,8 @@ struct WorkerCard {
     tokens: u64,
     cost: Option<f64>,
     tools: Vec<(bool, String)>,
+    gate: Option<(String, String)>,
+    live: String,
 }
 
 pub struct SageApp {
@@ -48,14 +67,16 @@ pub struct SageApp {
     md: CommonMarkCache,
     status: (AppStatus, String),
     live: BTreeMap<String, String>,
-    workers: BTreeMap<String, WorkerCard>,
-    plan: Option<(String, String)>,
+    tasks: Vec<TaskCard>,
+    last_request: String,
+    egui_ctx: egui::Context,
     notices: Vec<String>,
     confirm: Option<(String, String)>,
     runs: Vec<(String, String, String)>,
     pet: sage_avatar::PetView,
     pet_visible: bool,
     settings: SettingsPage,
+    usage: crate::usage::UsagePage,
     tray: Option<Tray>,
     hotkeys: Option<Hotkeys>,
     mic_held: bool,
@@ -69,6 +90,22 @@ pub struct SageApp {
 }
 
 impl SageApp {
+    /// Aplica a config nova na hora: cérebro, provedores, voz, atalhos e slime.
+    fn apply_config(&mut self, new: Config) {
+        let old = self.cfg.read().map(|c| c.clone()).unwrap_or_default();
+        if let Ok(mut c) = self.cfg.write() {
+            *c = new.clone();
+        }
+        self.rt.reload(&new);
+        self.pet.apply_config(&new);
+        self.pet_visible = new.enable_desktop_pet;
+        if old.hotkey_listen != new.hotkey_listen || old.hotkey_panel != new.hotkey_panel {
+            // Solta os atalhos antigos antes de registrar os novos.
+            self.hotkeys = None;
+            self.hotkeys = Hotkeys::register(&new.hotkey_listen, &new.hotkey_panel);
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, cfg: Arc<RwLock<Config>>, rt: Runtime) -> Self {
         theme::install(&cc.egui_ctx);
         let snapshot = cfg.read().map(|c| c.clone()).unwrap_or_default();
@@ -89,6 +126,7 @@ impl SageApp {
         let greeting = sage_core::persona::welcome(hour);
         let mut app = Self {
             settings: SettingsPage::new(&snapshot),
+            usage: crate::usage::UsagePage::new(),
             pet_visible: snapshot.enable_desktop_pet,
             cfg,
             events,
@@ -98,8 +136,9 @@ impl SageApp {
             md: CommonMarkCache::default(),
             status: (AppStatus::Idle, String::new()),
             live: BTreeMap::new(),
-            workers: BTreeMap::new(),
-            plan: None,
+            tasks: Vec::new(),
+            last_request: String::new(),
+            egui_ctx: cc.egui_ctx.clone(),
             notices: vec![],
             confirm: None,
             runs: load_runs(),
@@ -121,6 +160,10 @@ impl SageApp {
         app
     }
 
+    fn task_mut(&mut self, run_id: &str) -> Option<&mut TaskCard> {
+        self.tasks.iter_mut().rev().find(|t| t.run_id == run_id)
+    }
+
     fn push(&mut self, from_user: bool, text: String) {
         let when = chrono::Local::now().format("%H:%M").to_string();
         self.chat.push(ChatLine { from_user, text, when });
@@ -136,13 +179,25 @@ impl SageApp {
             self.pet.on_event(&ev);
             match ev {
                 SageEvent::Status { status, detail } => self.status = (status, detail),
-                SageEvent::UserText { text, from_voice } if from_voice => self.push(true, text),
+                SageEvent::UserText { text, from_voice } => {
+                    self.last_request.clone_from(&text);
+                    if from_voice {
+                        self.push(true, text);
+                    }
+                }
                 SageEvent::Reply { full, spoken, .. } => {
                     self.push(false, if full.trim().is_empty() { spoken } else { full });
                     self.live.remove("lead");
                 }
                 SageEvent::Stream { source, text, .. } => {
-                    let buf = self.live.entry(source).or_default();
+                    let running = self.tasks.iter_mut().rev().find(|t| t.done.is_none());
+                    let buf = match running {
+                        Some(t) if source == "lead" => &mut t.live,
+                        Some(t) if t.workers.contains_key(&source) => {
+                            &mut t.workers.get_mut(&source).expect("worker").live
+                        }
+                        _ => self.live.entry(source).or_default(),
+                    };
                     buf.push_str(&text);
                     if buf.len() > 6000 {
                         let cut = buf.len() - 6000;
@@ -150,32 +205,67 @@ impl SageApp {
                         buf.drain(..cut);
                     }
                 }
-                SageEvent::PlanReady { playbook, why, .. } => {
-                    self.workers.clear();
-                    self.live.retain(|k, _| k == "lead");
-                    self.plan = Some((playbook, why));
+                SageEvent::PlanReady { run_id, playbook, why, .. } => {
+                    let pending_live = self.live.remove("lead").unwrap_or_default();
+                    self.live.clear();
+                    if let Some(t) = self.tasks.iter_mut().find(|t| t.run_id == run_id) {
+                        t.playbook = playbook;
+                        t.why = why;
+                    } else {
+                        // Só a tarefa nova fica aberta.
+                        for t in &self.tasks {
+                            let mut st = egui::collapsing_header::CollapsingState::load_with_default_open(&self.egui_ctx, task_id(&t.run_id), false);
+                            st.set_open(false);
+                            st.store(&self.egui_ctx);
+                        }
+                        self.tasks.push(TaskCard {
+                            run_id,
+                            title: task_title(&self.last_request),
+                            playbook,
+                            why,
+                            when: chrono::Local::now().format("%H:%M").to_string(),
+                            started: std::time::Instant::now(),
+                            workers: BTreeMap::new(),
+                            live: pending_live,
+                            done: None,
+                            elapsed: None,
+                        });
+                    }
                     self.show_brain = true;
                 }
-                SageEvent::WorkerStart { worker, role, model, brief, .. } => {
-                    self.workers.insert(worker, WorkerCard { role, model, brief, ..Default::default() });
+                SageEvent::WorkerStart { run_id, worker, role, model, brief, .. } => {
+                    if let Some(t) = self.task_mut(&run_id) {
+                        t.workers.insert(worker, WorkerCard { role, model, brief, ..Default::default() });
+                    }
                 }
                 SageEvent::WorkerTool { worker, tool, ok, .. } => {
-                    if let Some(w) = self.workers.get_mut(&worker) {
+                    if let Some(w) = self.tasks.iter_mut().rev().find_map(|t| t.workers.get_mut(&worker)) {
                         w.tools.push((ok, tool));
                     }
                 }
-                SageEvent::WorkerEnd { worker, status, summary, usage, .. } => {
-                    if let Some(w) = self.workers.get_mut(&worker) {
+                SageEvent::WorkerEnd { run_id, worker, status, summary, usage, .. } => {
+                    if let Some(w) = self.task_mut(&run_id).and_then(|t| t.workers.get_mut(&worker)) {
                         w.status = Some(status);
                         w.summary = summary;
                         w.tokens = usage.total();
                         w.cost = usage.cost_usd;
                     }
                 }
+                SageEvent::Gate { run_id, worker, verdict, note } => {
+                    if let Some(w) = self.task_mut(&run_id).and_then(|t| t.workers.get_mut(&worker)) {
+                        w.gate = Some((verdict, note));
+                    }
+                }
+                SageEvent::RunReport { run_id, summary, usage, .. } => {
+                    self.runs = load_runs();
+                    if let Some(t) = self.task_mut(&run_id) {
+                        t.elapsed = Some(t.started.elapsed().as_secs());
+                        t.done = Some((summary, usage.cost_usd, usage.total()));
+                    }
+                }
                 SageEvent::ProviderSwitch { from, to, reason } => {
                     self.notices.push(format!("Trocando {from} por {to}: {reason}"));
                 }
-                SageEvent::RunReport { .. } => self.runs = load_runs(),
                 SageEvent::ConfirmRequest { id, question } => self.confirm = Some((id, question)),
                 SageEvent::Notice { text } => self.notices.push(text),
                 _ => {}
@@ -269,12 +359,15 @@ impl SageApp {
                         ui.label(RichText::new("cérebro orquestrador").size(11.5).color(p.muted));
                     });
                     ui.add_space(14.0);
-                    theme::segmented(
+                    let changed = theme::segmented(
                         ui,
                         "pages",
                         &mut self.page,
-                        &[(Page::Chat, "Conversa"), (Page::Runs, "Execuções"), (Page::Settings, "Configurações")],
+                        &[(Page::Chat, "Conversa"), (Page::Runs, "Execuções"), (Page::Usage, "Uso"), (Page::Settings, "Configurações")],
                     );
+                    if changed && self.page == Page::Settings {
+                        self.settings.opened();
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 14.0;
                         theme::switch(ui, &mut self.pet_visible, "Slime")
@@ -315,7 +408,7 @@ impl SageApp {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).show(ui, |ui| {
                     // Coluna de leitura centrada (linhas confortáveis em janelas largas).
-                    let col = ui.available_width().min(820.0);
+                    let col = ui.available_width().min(1040.0);
                     let pad = ((ui.available_width() - col) / 2.0).max(0.0);
                     ui.horizontal(|ui| {
                         ui.add_space(pad);
@@ -523,7 +616,9 @@ impl SageApp {
                         .id(input_id)
                         .desired_rows(1)
                         .frame(egui::Frame::NONE)
-                        .margin(Margin { left: 4, right: 4, top: 10, bottom: 8 })
+                        .margin(Margin { left: 4, right: 4, top: 8, bottom: 8 })
+                        .min_size(egui::vec2(0.0, 38.0))
+                        .vertical_align(Align::Center)
                         .font(egui::TextStyle::Body)
                         .desired_width((ui.available_width() - send_w).max(120.0))
                         .hint_text(RichText::new(hint).color(p.subtle));
@@ -572,123 +667,47 @@ impl SageApp {
 
     fn brain_panel(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
-        ui.label(theme::bold("Cérebro").size(theme::size::TITLE).color(p.text));
-        match &self.plan {
-            Some((pb, why)) => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Playbook").size(13.0).color(p.muted));
-                    theme::badge(ui, p.accent, pb);
+        ui.horizontal(|ui| {
+            ui.label(theme::bold("Tarefas").size(13.0).color(p.muted));
+            if !self.tasks.is_empty() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let running = self.tasks.iter().filter(|t| t.done.is_none()).count();
+                    let txt = if running > 0 { format!("{running} em andamento") } else { format!("{}", self.tasks.len()) };
+                    ui.label(RichText::new(txt).size(11.5).color(p.subtle));
                 });
-                ui.label(RichText::new(why).size(13.0).color(p.muted));
             }
-            None => {
-                ui.label(RichText::new("Pedidos grandes são divididos entre workers. Acompanhe aqui, ao vivo.").size(13.0).color(p.muted));
-                ui.add_space(12.0);
-                let steps = [
-                    ("Triagem", "Um modelo rápido decide: conversa, ação no PC ou tarefa."),
-                    ("Plano", "O lead escolhe um playbook e escreve um brief por unidade."),
-                    ("Workers", "Modelos mais baratos executam em paralelo, com cota vigiada."),
-                    ("Revisão e síntese", "Cada entrega passa por um gate; o lead junta tudo."),
-                ];
-                for (i, (title, desc)) in steps.iter().enumerate() {
-                    let r = ui
-                        .horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
-                            ui.painter().circle_filled(rect.center(), 13.0, p.accent_soft);
-                            ui.painter().circle_stroke(rect.center(), 13.0, Stroke::new(1.0, theme::mix(p.accent_soft, p.accent, 0.5)));
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                (i + 1).to_string(),
-                                egui::FontId::new(12.5, theme::bold_family()),
-                                p.accent,
-                            );
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                ui.label(theme::bold(*title).size(14.0).color(p.text));
-                                ui.label(RichText::new(*desc).size(12.5).color(p.muted));
-                            });
-                            rect
-                        })
-                        .inner;
-                    if i + 1 < steps.len() {
-                        // Linha do tempo ligando os passos.
-                        let x = r.center().x;
-                        let y0 = r.bottom() + 3.0;
-                        ui.add_space(10.0);
-                        let y1 = ui.cursor().top() - 1.0;
-                        ui.painter().line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], Stroke::new(1.5, p.border_strong));
-                    }
-                }
-            }
-        }
-        ui.add_space(12.0);
+        });
+        ui.add_space(6.0);
         egui::ScrollArea::vertical().id_salt("brain-scroll").auto_shrink(false).show(ui, |ui| {
-            if !self.workers.is_empty() {
-                theme::overline(ui, &format!("Workers · {}", self.workers.len()));
-                ui.add_space(2.0);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            if self.tasks.is_empty() {
+                ui.add_space(18.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Nenhuma tarefa ainda").size(13.5).color(p.muted));
+                    ui.label(RichText::new("Pedidos grandes aparecem aqui, divididos entre workers.").size(12.0).color(p.subtle));
+                });
             }
-            for (id, w) in &self.workers {
-                let accent = w.status.map_or(p.accent, |s| worker_color(&p, s));
-                let resp = egui::Frame::new()
-                    .fill(p.raised)
-                    .stroke(Stroke::new(1.0, p.border))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(Margin { left: 16, right: 12, top: 10, bottom: 10 })
-                    .shadow(theme::soft_shadow(&p))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(theme::bold(id).color(p.text));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match w.status {
-                                None => {
-                                    ui.add(egui::Spinner::new().size(14.0).color(p.accent));
-                                }
-                                Some(s) => theme::badge(ui, worker_color(&p, s), worker_label(s)),
-                            });
-                        });
-                        ui.label(RichText::new(format!("{} · {}", w.role, w.model)).size(12.5).color(p.muted));
-                        if w.status.is_some() {
-                            let cost = w.cost.map(|c| format!(" · US$ {c:.4}")).unwrap_or_default();
-                            ui.label(RichText::new(format!("{} tokens{cost}", fmt_int(w.tokens))).size(12.5).color(p.muted));
-                            if !w.summary.is_empty() {
-                                ui.label(&w.summary);
-                            }
-                        } else {
-                            ui.label(RichText::new(truncate(&w.brief, 180)).size(13.0));
-                        }
-                        for (ok, t) in w.tools.iter().rev().take(3) {
-                            let c = if *ok { p.ok } else { p.err };
-                            let mark = if *ok { "✔" } else { "✖" };
-                            ui.label(RichText::new(format!("{mark} {t}")).size(12.0).monospace().color(c));
-                        }
-                    });
-                // Faixa de status à esquerda do cartão.
-                let r = resp.response.rect;
-                let stripe = egui::Rect::from_min_max(r.min + egui::vec2(1.0, 10.0), egui::pos2(r.min.x + 4.0, r.max.y - 10.0));
-                ui.painter().rect_filled(stripe, CornerRadius::same(2), accent);
-                ui.add_space(8.0);
+            let newest = self.tasks.len().saturating_sub(1);
+            for (i, t) in self.tasks.iter().enumerate().rev() {
+                let failed = t.workers.values().any(|w| w.status == Some(WorkerStatus::Failed));
+                let status = match (&t.done, failed) {
+                    (None, _) => theme::RowStatus::Busy,
+                    (Some(_), true) => theme::RowStatus::Warn,
+                    (Some(_), false) => theme::RowStatus::Ok,
+                };
+                let meta = match t.elapsed {
+                    Some(s) => fmt_secs(s),
+                    None => t.when.clone(),
+                };
+                theme::disclosure(ui, task_id(&t.run_id), i == newest, status, &t.title, &meta, true, |ui| {
+                    task_body(ui, &p, t);
+                });
             }
-            if !self.live.is_empty() {
-                ui.add_space(6.0);
-                theme::overline(ui, "Raciocínio ao vivo");
-                for (src, text) in &self.live {
-                    egui::CollapsingHeader::new(RichText::new(src).size(13.0).strong())
-                        .id_salt(format!("live-{src}"))
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            egui::Frame::new()
-                                .fill(p.bg)
-                                .stroke(Stroke::new(1.0, p.border))
-                                .corner_radius(CornerRadius::same(10))
-                                .inner_margin(Margin::same(10))
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.label(RichText::new(truncate_tail(text, 1200)).size(12.0).monospace().color(p.muted));
-                                });
-                        });
-                }
+            if let Some(text) = self.live.get("lead").filter(|t| !t.trim().is_empty()) {
+                ui.add_space(4.0);
+                theme::disclosure(ui, egui::Id::unique("live-lead"), false, theme::RowStatus::Busy, "Pensando…", "lead", false, |ui| {
+                    live_box(ui, &p, text);
+                });
             }
         });
     }
@@ -734,18 +753,146 @@ impl SageApp {
                     });
                 });
             }
+            let md_cache = &mut self.md;
             for (id, title, md) in &self.runs {
-                theme::card(ui).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    egui::CollapsingHeader::new(theme::bold(title.clone()).color(p.text)).id_salt(id).show(ui, |ui| {
-                        ui.label(RichText::new(id).size(12.0).monospace().color(p.muted));
-                        CommonMarkViewer::new().show(ui, &mut self.md, md);
+                let when = run_when(id);
+                theme::disclosure(ui, egui::Id::unique(("run", id)), false, theme::RowStatus::Ok, title, &when, true, |ui| {
+                    theme::card(ui).inner_margin(Margin::symmetric(18, 12)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(id).size(12.0).monospace().color(p.subtle));
+                        CommonMarkViewer::new().show(ui, md_cache, md);
                     });
+                    ui.add_space(6.0);
                 });
-                ui.add_space(8.0);
+                ui.add_space(2.0);
             }
         });
     }
+}
+
+/// "20261118-0615-ab12" → "18/11 06:15" (o id da execução começa pela data).
+fn run_when(id: &str) -> String {
+    let d: String = id.chars().filter(|c| c.is_ascii_digit()).take(12).collect();
+    if d.len() >= 12 { format!("{}/{} {}:{}", &d[6..8], &d[4..6], &d[8..10], &d[10..12]) } else { String::new() }
+}
+
+fn task_id(run_id: &str) -> egui::Id {
+    egui::Id::unique(("task", run_id))
+}
+
+/// Título curto da tarefa a partir do pedido do usuário.
+fn task_title(request: &str) -> String {
+    let one = request.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut t = truncate(&one, 64);
+    if let Some(c) = t.chars().next() {
+        t = c.to_uppercase().collect::<String>() + &t[c.len_utf8()..];
+    }
+    if t.is_empty() { "Tarefa".into() } else { t }
+}
+
+fn fmt_secs(s: u64) -> String {
+    if s >= 60 { format!("{}min {:02}s", s / 60, s % 60) } else { format!("{s}s") }
+}
+
+fn live_box(ui: &mut egui::Ui, p: &Palette, text: &str) {
+    egui::Frame::new()
+        .fill(p.bg)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(truncate_tail(text, 1200)).size(11.5).monospace().color(p.muted));
+        });
+}
+
+/// Corpo aberto de uma tarefa: plano, linha dos workers (estilo subagentes) e resumo.
+fn task_body(ui: &mut egui::Ui, p: &Palette, t: &TaskCard) {
+    ui.indent(("task-body", &t.run_id), |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        if !t.playbook.is_empty() || !t.why.is_empty() {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if !t.playbook.is_empty() {
+                    theme::badge(ui, p.accent, &t.playbook);
+                }
+                if !t.why.is_empty() {
+                    ui.label(RichText::new(truncate(&t.why, 160)).size(12.0).color(p.muted));
+                }
+            });
+            ui.add_space(4.0);
+        }
+        let top = ui.cursor().top();
+        for (id, w) in &t.workers {
+            let status = match w.status {
+                None => theme::RowStatus::Busy,
+                Some(WorkerStatus::Done) => theme::RowStatus::Ok,
+                Some(WorkerStatus::DoneWithConcerns) => theme::RowStatus::Warn,
+                Some(_) => theme::RowStatus::Err,
+            };
+            let model = w.model.rsplit(':').next().unwrap_or(&w.model).split('@').next().unwrap_or("");
+            let title = if w.role.is_empty() { id.clone() } else { format!("{id} · {}", w.role) };
+            theme::disclosure(ui, egui::Id::unique(("worker", &t.run_id, id)), false, status, &title, model, false, |ui| {
+                worker_body(ui, p, w);
+            });
+        }
+        if t.workers.is_empty() && t.done.is_none() {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.add(egui::Spinner::new().size(12.0).color(p.accent));
+                ui.label(RichText::new("Montando o plano…").size(12.0).color(p.muted));
+            });
+        }
+        // Fio vertical ligando os workers à tarefa (como subagentes numa barra lateral).
+        let bottom = ui.cursor().top() - 4.0;
+        if bottom > top + 8.0 {
+            let x = ui.min_rect().left() - 6.0;
+            ui.painter().line_segment([egui::pos2(x, top + 4.0), egui::pos2(x, bottom)], Stroke::new(1.0, p.border_strong));
+        }
+        if !t.live.trim().is_empty() {
+            theme::disclosure(ui, egui::Id::unique(("task-live", &t.run_id)), false, theme::RowStatus::None, "Raciocínio do lead", "", false, |ui| {
+                live_box(ui, p, &t.live);
+            });
+        }
+        if let Some((summary, cost, tokens)) = &t.done {
+            ui.add_space(4.0);
+            let cost = cost.map(|c| format!(" · US$ {c:.2}")).unwrap_or_default();
+            ui.label(RichText::new(format!("Concluída · {} tokens{cost}", fmt_int(*tokens))).size(11.5).color(p.subtle));
+            if !summary.trim().is_empty() {
+                ui.label(RichText::new(truncate(summary, 280)).size(12.5).color(p.muted));
+            }
+        }
+        ui.add_space(6.0);
+    });
+}
+
+fn worker_body(ui: &mut egui::Ui, p: &Palette, w: &WorkerCard) {
+    ui.indent("worker-body", |ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        ui.label(RichText::new(&w.model).size(11.5).monospace().color(p.subtle));
+        if w.status.is_some() {
+            let cost = w.cost.map(|c| format!(" · US$ {c:.4}")).unwrap_or_default();
+            ui.label(RichText::new(format!("{} tokens{cost}", fmt_int(w.tokens))).size(11.5).color(p.subtle));
+            if !w.summary.is_empty() {
+                ui.label(RichText::new(&w.summary).size(12.5).color(p.text));
+            }
+        } else {
+            ui.label(RichText::new(truncate(&w.brief, 220)).size(12.5).color(p.muted));
+        }
+        if let Some((verdict, note)) = &w.gate {
+            ui.label(RichText::new(format!("Gate: {verdict} {}", truncate(note, 140))).size(11.5).color(p.muted));
+        }
+        for (ok, t) in w.tools.iter().rev().take(4) {
+            let c = if *ok { p.ok } else { p.err };
+            let mark = if *ok { "✔" } else { "✖" };
+            ui.label(RichText::new(format!("{mark} {t}")).size(11.5).monospace().color(c));
+        }
+        if w.status.is_none() && !w.live.trim().is_empty() {
+            live_box(ui, p, &w.live);
+        }
+        ui.add_space(4.0);
+    });
 }
 
 /// Cartão clicável de sugestão (estado vazio da conversa).
@@ -795,15 +942,18 @@ impl eframe::App for SageApp {
                     .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 22, bottom: 16 }))
                     .show(ui, |ui| self.runs_page(ui));
             }
+            Page::Usage => {
+                let cfg = self.cfg.read().map(|c| c.clone()).unwrap_or_default();
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 22, bottom: 16 }))
+                    .show(ui, |ui| self.usage.ui(ui, &cfg));
+            }
             Page::Settings => {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(p.bg).inner_margin(Margin { left: 28, right: 28, top: 22, bottom: 16 }))
                     .show(ui, |ui| {
                         if let Some(saved) = self.settings.ui(ui) {
-                            if let Ok(mut c) = self.cfg.write() {
-                                *c = saved;
-                            }
-                            self.rt.send(Command::ReloadConfig);
+                            self.apply_config(saved);
                         }
                     });
             }

@@ -271,6 +271,56 @@ const EDITABLE: [(&str, &str); 6] = [
     ("EMOTIONS", EMOTIONS_BLOCK),
 ];
 
+/// A block the settings page can edit: id, label, built-in text and current text.
+pub struct PersonaBlock {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub default: &'static str,
+    pub text: String,
+}
+
+/// Editable blocks with what is in effect now (override or default).
+pub fn editable_blocks() -> Vec<PersonaBlock> {
+    let overrides = load_overrides();
+    EDITABLE
+        .iter()
+        .map(|(id, default)| PersonaBlock {
+            id,
+            label: match *id {
+                "IDENTITY" => "Identidade e personalidade",
+                "THINKING" => "Como pensa",
+                "SCOPES" => "Escopos de resposta",
+                "PLANNING" => "Como divide tarefas",
+                "AUTONOMY" => "Autonomia e alinhamento",
+                _ => "Emoções do avatar",
+            },
+            default,
+            text: overrides.get(*id).cloned().unwrap_or_else(|| default.to_string()),
+        })
+        .collect()
+}
+
+/// Saves the blocks to `data/persona.json`; a block equal to its default is not stored.
+/// Takes effect on the next request (the prompts read the file every time).
+pub fn save_blocks(blocks: &[(String, String)]) -> std::io::Result<()> {
+    let mut map = serde_json::Map::new();
+    for (id, text) in blocks {
+        let default = EDITABLE.iter().find(|(k, _)| k == id).map(|(_, d)| *d);
+        if let Some(d) = default
+            && text.trim() != d.trim()
+            && !text.trim().is_empty()
+        {
+            map.insert(id.clone(), Value::String(text.clone()));
+        }
+    }
+    let path = paths::data().join("persona.json");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::json!({ "blocks": map })).unwrap_or_default();
+    std::fs::write(path, body)
+}
+
 /// Overrides of the editable blocks, read from `data/persona.json`.
 fn load_overrides() -> HashMap<String, String> {
     let path = paths::data().join("persona.json");

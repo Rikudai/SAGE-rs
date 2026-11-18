@@ -1,6 +1,8 @@
 //! sage-tools — `PcToolbox`: controle do PC via Win32 (ver docs/ARCHITECTURE.md).
 
 mod args;
+pub mod memory;
+pub mod skills;
 mod files;
 mod keys;
 mod safety;

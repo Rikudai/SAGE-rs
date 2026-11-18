@@ -14,4 +14,4 @@ pub mod tools;
 pub use config::Config;
 pub use events::{AppStatus, EventBus, SageEvent};
 pub use llm::*;
-pub use tools::{ToolResult, ToolSpec, Toolbox};
+pub use tools::{MemoryHook, ToolResult, ToolSpec, Toolbox};

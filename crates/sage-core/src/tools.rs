@@ -48,3 +48,11 @@ pub trait Toolbox: Send + Sync {
     fn specs(&self) -> Vec<ToolSpec>;
     async fn call(&self, name: &str, args: Value) -> ToolResult;
 }
+
+/// Memória de longo prazo vista pelo cérebro (implementada em `sage-tools::memory`).
+/// `recall` devolve um bloco de texto curto para o prompt (vazio quando não há nada útil);
+/// `observe` registra um turno concluído.
+pub trait MemoryHook: Send + Sync {
+    fn recall(&self, query: &str) -> String;
+    fn observe(&self, user: &str, reply: &str);
+}

@@ -163,7 +163,11 @@ impl ResolvedVoiceSettings {
             cfg.tts_provider.trim().to_string()
         };
 
-        let fish_reference_id = if cfg.fish_audio_reference_id.trim().is_empty() {
+        // Um reference_id que é a voz de algum perfil embutido (o config antigo guardava o
+        // da Clássica/Jarvis) não sobrepõe o perfil escolhido; só uma voz própria sobrepõe.
+        let explicit = cfg.fish_audio_reference_id.trim();
+        let builtin = explicit == DEFAULT_FISH_REFERENCE_ID || PROFILES.iter().any(|p| p.fish_model_id == explicit);
+        let fish_reference_id = if explicit.is_empty() || builtin {
             profile.fish_model_id.to_string()
         } else {
             cfg.fish_audio_reference_id.trim().to_string()
@@ -239,6 +243,15 @@ mod tests {
         assert_eq!(resolved.rate, "+3%");
         assert_eq!(resolved.pitch, "+2Hz");
         assert_eq!(resolved.volume, "+0%");
+    }
+
+    #[test]
+    fn builtin_reference_id_does_not_override_chosen_profile() {
+        let mut cfg = Config::default();
+        cfg.voice_profile = "rimuru".to_string();
+        cfg.fish_audio_reference_id = DEFAULT_FISH_REFERENCE_ID.to_string();
+        let resolved = ResolvedVoiceSettings::from_config(&cfg);
+        assert_eq!(resolved.fish_reference_id, "9dfb8ae2b936473d892167cc3f3a7233");
     }
 
     #[test]

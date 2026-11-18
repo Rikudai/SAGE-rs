@@ -8,6 +8,7 @@ pub mod hub;
 pub mod openai;
 pub mod sse;
 pub mod util;
+pub mod whisper;
 
 pub use agents::{AgyCli, ClaudeCli, CodexCli};
 pub use cooldown::Cooldowns;

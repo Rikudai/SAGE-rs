@@ -20,6 +20,8 @@ pub struct SpriteLibrary {
     decoded: Arc<Mutex<HashMap<Key, ColorImage>>>,
     /// (escopo, animação) cuja decodificação em segundo plano já foi pedida.
     requested: RefCell<HashSet<(String, String)>>,
+    /// Pedidos cuja thread de fundo já terminou.
+    finished: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 type Key = (String, String, usize);
@@ -42,6 +44,7 @@ impl SpriteLibrary {
             textures: RefCell::default(),
             decoded: Arc::default(),
             requested: RefCell::default(),
+            finished: Arc::default(),
         }
     }
 
@@ -71,9 +74,12 @@ impl SpriteLibrary {
         if self.requested.borrow().contains(&req) {
             return;
         }
-        self.requested.borrow_mut().insert(req);
+        self.requested.borrow_mut().insert(req.clone());
         let count = self.frame_count(scope, anim);
         if count == 0 {
+            if let Ok(mut f) = self.finished.lock() {
+                f.insert(req);
+            }
             return;
         }
         let done: Vec<usize> = {
@@ -83,6 +89,7 @@ impl SpriteLibrary {
         let dir = self.root.join(scope_dir(scope));
         let (scope, anim) = (scope.to_string(), anim.to_string());
         let out = self.decoded.clone();
+        let finished = self.finished.clone();
         let spawned = std::thread::Builder::new().name("sage-sprites".into()).spawn(move || {
             for idx in (0..count).filter(|i| !done.contains(i)) {
                 if let Ok(img) = load_image(&dir.join(format!("{anim}_{idx}.png")))
@@ -91,10 +98,21 @@ impl SpriteLibrary {
                     m.insert((scope.clone(), anim.clone(), idx), img);
                 }
             }
+            if let Ok(mut f) = finished.lock() {
+                f.insert((scope, anim));
+            }
         });
         if let Err(e) = spawned {
+            if let Ok(mut f) = self.finished.lock() {
+                f.insert(req);
+            }
             tracing::warn!("não consegui decodificar sprites em segundo plano: {e}");
         }
+    }
+
+    fn decoding(&self, scope: &str, anim: &str) -> bool {
+        let req = (scope.to_string(), anim.to_string());
+        self.requested.borrow().contains(&req) && !self.finished.lock().map(|f| f.contains(&req)).unwrap_or(true)
     }
 
     fn take_decoded(&self, key: &Key) -> Option<ColorImage> {
@@ -110,6 +128,10 @@ impl SpriteLibrary {
         let name = format!("{scope}/{anim}_{idx}");
         let tex = if let Some(img) = self.take_decoded(&key) {
             Some(ctx.load_texture(name, img, TextureOptions::LINEAR))
+        } else if self.decoding(scope, anim) {
+            // Ainda decodificando em segundo plano: não trava o quadro lendo PNG aqui
+            // (quem desenha repete o quadro anterior até este chegar).
+            return None;
         } else {
             let path = self.root.join(scope_dir(scope)).join(format!("{anim}_{idx}.png"));
             match load_image(&path) {

@@ -130,9 +130,20 @@ impl ModelHub for Hub {
         out
     }
 
+    /// Groq Whisper primeiro (rápido), Gemini de reserva.
     fn transcriber(&self) -> Option<Arc<dyn Transcriber>> {
-        let t = GeminiTranscriber::from_config(&self.cfg, self.http.clone())?;
-        Some(Arc::new(t))
+        let mut chain: Vec<Arc<dyn Transcriber>> = Vec::new();
+        if let Some(w) = crate::whisper::WhisperTranscriber::from_config(&self.cfg, self.http.clone()) {
+            chain.push(Arc::new(w));
+        }
+        if let Some(g) = GeminiTranscriber::from_config(&self.cfg, self.http.clone()) {
+            chain.push(Arc::new(g));
+        }
+        match chain.len() {
+            0 => None,
+            1 => chain.pop(),
+            _ => Some(Arc::new(crate::whisper::ChainTranscriber(chain))),
+        }
     }
 }
 

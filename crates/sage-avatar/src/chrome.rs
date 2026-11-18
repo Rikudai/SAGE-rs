@@ -123,3 +123,53 @@ pub fn strip(title: &str) -> bool {
 pub fn strip(_title: &str) -> bool {
     true
 }
+
+/// Cursor do mouse em pixels físicos da tela.
+#[cfg(windows)]
+pub fn cursor_px() -> Option<(f32, f32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p) }.ok()?;
+    Some((p.x as f32, p.y as f32))
+}
+
+#[cfg(not(windows))]
+pub fn cursor_px() -> Option<(f32, f32)> {
+    None
+}
+
+/// Botão esquerdo do mouse pressionado agora (vale mesmo com o cursor fora da janela).
+#[cfg(windows)]
+pub fn left_button_down() -> Option<bool> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+    // Com os botões trocados no Windows, o botão "principal" é o direito físico.
+    let vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 { VK_RBUTTON } else { VK_LBUTTON };
+    Some(unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0)
+}
+
+#[cfg(not(windows))]
+pub fn left_button_down() -> Option<bool> {
+    None
+}
+
+/// Área útil (sem a barra de tarefas) do monitor que contém o ponto, em pixels físicos:
+/// `[esquerda, topo, direita, base]`.
+#[cfg(windows)]
+pub fn work_area_px(x: f32, y: f32) -> Option<[f32; 4]> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
+    let mon = unsafe { MonitorFromPoint(POINT { x: x as i32, y: y as i32 }, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if !unsafe { GetMonitorInfoW(mon, &mut info) }.as_bool() {
+        return None;
+    }
+    let r = info.rcWork;
+    Some([r.left as f32, r.top as f32, r.right as f32, r.bottom as f32])
+}
+
+#[cfg(not(windows))]
+pub fn work_area_px(_x: f32, _y: f32) -> Option<[f32; 4]> {
+    None
+}

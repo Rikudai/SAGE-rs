@@ -1,16 +1,89 @@
 //! Liga os crates: hub de modelos, ferramentas, cérebro e voz num runtime tokio.
 
 use anyhow::Result;
+use async_trait::async_trait;
+use sage_core::config::ModelRef;
 use sage_core::events::Command;
+use sage_core::llm::{AgentCli, Llm, Transcriber};
+use sage_core::tools::{ToolResult, ToolSpec};
 use sage_core::{Config, EventBus, ModelHub, SageEvent, Toolbox};
-use std::sync::{Arc, RwLock};
+use serde_json::Value;
+use std::sync::{Arc, PoisonError, RwLock};
 use tokio::sync::mpsc;
+
+/// Hub de modelos trocável: o cérebro guarda este `Arc`, e salvar as configurações
+/// troca o hub de dentro (chaves, provedores e modelos novos valem no próximo pedido).
+struct SwapHub(RwLock<Arc<dyn ModelHub>>);
+
+impl SwapHub {
+    fn get(&self) -> Arc<dyn ModelHub> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+impl ModelHub for SwapHub {
+    fn llm(&self, m: &ModelRef) -> Option<Arc<dyn Llm>> {
+        self.get().llm(m)
+    }
+    fn agent(&self, provider: &str) -> Option<Arc<dyn AgentCli>> {
+        self.get().agent(provider)
+    }
+    fn available(&self) -> Vec<String> {
+        self.get().available()
+    }
+    fn transcriber(&self) -> Option<Arc<dyn Transcriber>> {
+        self.get().transcriber()
+    }
+}
+
+/// Ferramentas do PC + memória + skills, numa caixa só (cada nome vai para a dona).
+struct SageTools {
+    pc: Arc<dyn Toolbox>,
+    extra: Vec<Arc<dyn Toolbox>>,
+}
+
+#[async_trait]
+impl Toolbox for SageTools {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut v = self.pc.specs();
+        for t in &self.extra {
+            v.extend(t.specs());
+        }
+        v
+    }
+    async fn call(&self, name: &str, args: Value) -> ToolResult {
+        for t in &self.extra {
+            if t.specs().iter().any(|s| s.name == name) {
+                return t.call(name, args).await;
+            }
+        }
+        self.pc.call(name, args).await
+    }
+}
+
+/// Ferramentas trocáveis (liga/desliga ações no PC e PowerShell na hora).
+struct SwapTools(RwLock<Arc<dyn Toolbox>>);
+
+#[async_trait]
+impl Toolbox for SwapTools {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner).specs()
+    }
+    async fn call(&self, name: &str, args: Value) -> ToolResult {
+        let tools = self.0.read().unwrap_or_else(PoisonError::into_inner).clone();
+        tools.call(name, args).await
+    }
+}
 
 pub struct Runtime {
     pub rt: tokio::runtime::Runtime,
     pub bus: EventBus,
     pub cmd: mpsc::Sender<Command>,
     pub voice: Arc<sage_voice::Voice>,
+    hub: Arc<SwapHub>,
+    tools: Arc<SwapTools>,
+    pub memory: Arc<sage_tools::memory::MemoryStore>,
+    extra: Vec<Arc<dyn Toolbox>>,
 }
 
 impl Runtime {
@@ -23,14 +96,24 @@ impl Runtime {
         let bus = EventBus::new();
         let snapshot = cfg.read().map_err(|_| anyhow::anyhow!("config travada"))?.clone();
 
-        let hub: Arc<dyn ModelHub> = Arc::new(sage_providers::Hub::new(&snapshot)?);
-        let tools: Arc<dyn Toolbox> = Arc::new(sage_tools::PcToolbox::new(&snapshot));
+        let swap_hub = Arc::new(SwapHub(RwLock::new(Arc::new(sage_providers::Hub::new(&snapshot)?))));
+        let memory = sage_tools::memory::MemoryStore::open(sage_core::paths::data().join("memory"));
+        let skills = Arc::new(sage_tools::skills::SkillCatalog::new(sage_core::paths::root()));
+        let extra: Vec<Arc<dyn Toolbox>> = vec![
+            Arc::new(sage_tools::memory::MemoryTools(memory.clone())),
+            Arc::new(sage_tools::skills::SkillTools(skills)),
+        ];
+        let pc: Arc<dyn Toolbox> = Arc::new(sage_tools::PcToolbox::new(&snapshot));
+        let swap_tools = Arc::new(SwapTools(RwLock::new(Arc::new(SageTools { pc, extra: extra.clone() }))));
+        let hub: Arc<dyn ModelHub> = swap_hub.clone();
+        let tools: Arc<dyn Toolbox> = swap_tools.clone();
         let voice = Arc::new(sage_voice::Voice::new(&snapshot, hub.transcriber(), bus.clone()));
 
         let (tx, rx) = mpsc::channel::<Command>(64);
         let brain = {
             let _g = rt.enter();
-            sage_brain::Brain::new(cfg.clone(), hub, tools, bus.clone())?
+            let mem: Arc<dyn sage_core::MemoryHook> = memory.clone();
+            sage_brain::Brain::new_with_memory(cfg.clone(), hub, tools, bus.clone(), Some(mem))?
         };
         rt.spawn(brain.run(rx));
 
@@ -54,7 +137,23 @@ impl Runtime {
             });
         }
 
-        Ok(Self { rt, bus, cmd: tx, voice })
+        Ok(Self { rt, bus, cmd: tx, voice, hub: swap_hub, tools: swap_tools, memory, extra })
+    }
+
+    /// Aplica uma config nova sem reiniciar: modelos/chaves, ferramentas, voz e playbooks.
+    pub fn reload(&self, cfg: &Config) {
+        match sage_providers::Hub::new(cfg) {
+            Ok(h) => {
+                let h: Arc<dyn ModelHub> = Arc::new(h);
+                self.voice.set_transcriber(h.transcriber());
+                *self.hub.0.write().unwrap_or_else(PoisonError::into_inner) = h;
+            }
+            Err(e) => tracing::warn!("config nova: não consegui montar os provedores ({e:#}); mantive os antigos"),
+        }
+        let pc: Arc<dyn Toolbox> = Arc::new(sage_tools::PcToolbox::new(cfg));
+        *self.tools.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(SageTools { pc, extra: self.extra.clone() });
+        self.voice.update_config(cfg);
+        self.send(Command::ReloadConfig);
     }
 
     pub fn ask(&self, text: String, from_voice: bool) {

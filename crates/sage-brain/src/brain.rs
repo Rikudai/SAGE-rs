@@ -18,7 +18,7 @@ use sage_core::llm::{
     AgentCli, AgentMode, ChatRequest, ChatResponse, Llm, LlmError, Message, ModelHub, ModelRef, Tier, Usage,
     WorkerStatus,
 };
-use sage_core::tools::{ToolResult, Toolbox};
+use sage_core::tools::{MemoryHook, ToolResult, Toolbox};
 
 use crate::budget::{Budget, BudgetLimits, BudgetState, WhenLow};
 use crate::confirm::Confirmer;
@@ -72,6 +72,7 @@ pub struct BrainOptions {
     /// Holds `quota.json` and `runs/`.
     pub data_dir: PathBuf,
     pub settings: BrainSettings,
+    pub memory: Option<Arc<dyn MemoryHook>>,
 }
 
 impl BrainOptions {
@@ -82,6 +83,7 @@ impl BrainOptions {
             prompts: Arc::new(CorePrompts),
             data_dir,
             settings: BrainSettings::default(),
+            memory: None,
         }
     }
 
@@ -340,6 +342,9 @@ struct Inner {
     /// Cancellation of the request in progress.
     current: Mutex<Option<CancellationToken>>,
     settings: BrainSettings,
+    /// Memória de longo prazo (opcional) e o que ela lembrou para o pedido atual.
+    memory: Option<Arc<dyn MemoryHook>>,
+    recall: Mutex<String>,
 }
 
 /// The orchestrator brain. Cheap to clone (shared state).
@@ -356,10 +361,22 @@ impl Brain {
         tools: Arc<dyn Toolbox>,
         bus: EventBus,
     ) -> anyhow::Result<Self> {
+        Self::new_with_memory(cfg, hub, tools, bus, None)
+    }
+
+    /// Igual a `new`, com memória de longo prazo (lembra antes de responder e registra cada turno).
+    pub fn new_with_memory(
+        cfg: Arc<RwLock<Config>>,
+        hub: Arc<dyn ModelHub>,
+        tools: Arc<dyn Toolbox>,
+        bus: EventBus,
+        memory: Option<Arc<dyn MemoryHook>>,
+    ) -> anyhow::Result<Self> {
         let path = sage_core::paths::playbooks_file();
         let playbooks = Playbooks::load(&path)?;
         let mut opts = BrainOptions::new(playbooks, sage_core::paths::data());
         opts.playbooks_path = Some(path);
+        opts.memory = memory;
         Ok(Self::with_options(cfg, hub, tools, bus, opts))
     }
 
@@ -388,6 +405,8 @@ impl Brain {
                 confirmer,
                 current: Mutex::new(None),
                 settings: opts.settings,
+                memory: opts.memory,
+                recall: Mutex::new(String::new()),
             }),
         }
     }
@@ -488,11 +507,24 @@ impl Brain {
         *lock(&self.inner.current) = Some(cancel.clone());
         self.inner.bus.emit(SageEvent::UserText { text: text.to_string(), from_voice });
         self.inner.bus.status(AppStatus::Thinking, "Pensando...");
+        if let Some(m) = &self.inner.memory {
+            let m = m.clone();
+            let q = text.to_string();
+            let block = tokio::task::spawn_blocking(move || m.recall(&q)).await.unwrap_or_default();
+            *lock(&self.inner.recall) = block;
+        }
         let out = if text.is_empty() {
             TurnOutcome::text(TurnKind::Chat, "Não entendi; pode repetir?", None)
         } else {
             self.turn(text, &cancel).await
         };
+        if let Some(m) = &self.inner.memory
+            && !text.is_empty()
+        {
+            let m = m.clone();
+            let (u, r) = (text.to_string(), out.full.clone());
+            tokio::task::spawn_blocking(move || m.observe(&u, &r));
+        }
         *lock(&self.inner.current) = None;
         if !text.is_empty() {
             self.push_history(text, &out.full);
@@ -510,6 +542,12 @@ impl Brain {
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /// Acrescenta ao prompt de sistema o que a memória lembrou para este pedido.
+    fn with_memory(&self, system: String) -> String {
+        let recall = lock(&self.inner.recall).clone();
+        if recall.trim().is_empty() { system } else { format!("{system}\n\n{recall}") }
+    }
 
     fn notice(&self, text: &str) {
         self.inner.bus.emit(SageEvent::Notice { text: text.to_string() });
@@ -667,18 +705,38 @@ impl Brain {
         let heuristic_task = prompts.looks_like_task(text) && prompts.complexity(text) >= TASK_COMPLEXITY;
         match triage {
             Some(t) if t.kind == TurnKind::Task || (t.kind == TurnKind::Chat && heuristic_task) => {
+                self.acknowledge(text, &t.reply);
                 self.orchestrate(text, &cfg, cancel).await
             }
             Some(t) if t.kind == TurnKind::Action => match t.action {
                 Some(action) => self.single_action(text, &cfg, &action, t.params, &t.reply, t.emotion, cancel).await,
-                None if heuristic_task => self.orchestrate(text, &cfg, cancel).await,
+                None if heuristic_task => {
+                    self.acknowledge(text, &t.reply);
+                    self.orchestrate(text, &cfg, cancel).await
+                }
                 None => self.chat_reply(text, &cfg, cancel).await,
             },
             Some(t) if !t.reply.is_empty() => TurnOutcome::text(TurnKind::Chat, t.reply, t.emotion),
             Some(_) => self.chat_reply(text, &cfg, cancel).await,
-            None if heuristic_task => self.orchestrate(text, &cfg, cancel).await,
+            None if heuristic_task => {
+                self.acknowledge(text, "");
+                self.orchestrate(text, &cfg, cancel).await
+            }
             None => self.chat_reply(text, &cfg, cancel).await,
         }
+    }
+
+    /// Responde na hora que vai fazer a tarefa (falado e no chat) enquanto a
+    /// orquestração começa; o resultado chega depois, numa segunda resposta.
+    fn acknowledge(&self, request: &str, triage_reply: &str) {
+        let reply = triage_reply.trim();
+        let text = if !reply.is_empty() && reply.chars().count() <= 220 {
+            reply.to_string()
+        } else {
+            ack_text(request).to_string()
+        };
+        self.inner.bus.emit(SageEvent::Reply { spoken: text.clone(), full: text, emotion: Some("determinado".into()) });
+        self.inner.bus.status(AppStatus::Orchestrating, "Planejando...");
     }
 
     async fn triage(&self, text: &str, cfg: &CfgView, cancel: &CancellationToken) -> Option<Triage> {
@@ -686,7 +744,7 @@ impl Brain {
         let specs = self.inner.tools.specs();
         let system = format!(
             "{}\n\n{}",
-            self.inner.prompts.chat(cfg.user_name.as_deref(), false),
+            self.with_memory(self.inner.prompts.chat(cfg.user_name.as_deref(), false)),
             templates::triage_instructions(&specs, &self.inner.prompts.emotions())
         );
         let mut messages = self.history_messages();
@@ -703,7 +761,7 @@ impl Brain {
         let mut messages = self.history_messages();
         messages.push(Message::user(text));
         let req = ChatRequest {
-            system: self.inner.prompts.chat(cfg.user_name.as_deref(), true),
+            system: self.with_memory(self.inner.prompts.chat(cfg.user_name.as_deref(), true)),
             messages,
             temperature: Some(0.7),
             max_tokens: Some(2048),
@@ -807,7 +865,7 @@ impl Brain {
             "{}
 
 Você acabou de executar a ferramenta '{tool}' para atender o pedido. Responda ao usuário              com o resultado concreto, em 1 ou 2 frases curtas para serem faladas, sem markdown, sem dizer              que vai checar (já checou) e sem repetir a pergunta.",
-            self.inner.prompts.chat(cfg.user_name.as_deref(), false)
+            self.with_memory(self.inner.prompts.chat(cfg.user_name.as_deref(), false))
         );
         let req = ChatRequest {
             system,
@@ -1001,7 +1059,7 @@ Resultado da ferramenta:
     }
 
     fn lead_system(&self, ctx: &RunCtx) -> String {
-        templates::lead_system(&self.inner.prompts.lead(ctx.cfg.user_name.as_deref()), &ctx.pb.principles)
+        templates::lead_system(&self.with_memory(self.inner.prompts.lead(ctx.cfg.user_name.as_deref())), &ctx.pb.principles)
     }
 
     async fn pick_playbook(&self, ctx: &RunCtx) -> PlaybookChoice {
@@ -1116,10 +1174,13 @@ Resultado da ferramenta:
         let mut tries = Attempts::default();
         let mut feedback: Option<String> = None;
         let mut resume: Option<String> = None;
+        // Depois de uma falha do provedor, a próxima tentativa troca de via (API <-> CLI)
+        // quando há alternativa, em vez de bater de novo no mesmo modelo sobrecarregado.
+        let mut flip = false;
         loop {
             tally.attempts += 1;
             let brief = worker::build_brief(unit, prior, feedback.as_deref());
-            let (run, used_tier) = match self.execute(ctx, unit, tier, brief, resume.take()).await {
+            let (run, used_tier) = match self.execute(ctx, unit, tier, brief, resume.take(), flip).await {
                 Ok(r) => r,
                 Err(msg) => {
                     self.notice(&format!("{}: {msg}", unit.id));
@@ -1188,6 +1249,9 @@ Resultado da ferramenta:
                 }
                 NextStep::Retry => {
                     tries.retries += 1;
+                    if infra {
+                        flip = !flip;
+                    }
                     if !infra {
                         resume.clone_from(&run.outcome.session_id);
                     }
@@ -1211,8 +1275,9 @@ Resultado da ferramenta:
         tier: Tier,
         brief: String,
         resume: Option<String>,
+        flip: bool,
     ) -> Result<(WorkerRun, Tier), String> {
-        let (selection, tier) = self.select_models(ctx, unit, tier).await?;
+        let (selection, tier) = self.select_models(ctx, unit, tier, flip).await?;
         let persona = self.inner.prompts.worker(&worker::role_text(unit));
         let run = match selection {
             Selection::Api(models) => {
@@ -1255,7 +1320,7 @@ Resultado da ferramenta:
 
     /// Tier -> models: phase rules, preferred provider, profile overrides, availability
     /// and quota (first healthy provider at the same tier). Returns the tier used.
-    async fn select_models(&self, ctx: &RunCtx, unit: &UnitSpec, tier: Tier) -> Result<(Selection, Tier), String> {
+    async fn select_models(&self, ctx: &RunCtx, unit: &UnitSpec, tier: Tier, flip: bool) -> Result<(Selection, Tier), String> {
         let hub = &self.inner.hub;
         let available = hub.available();
         if unit.phase == LEAD_PHASE {
@@ -1325,15 +1390,25 @@ Resultado da ferramenta:
                 Some((adjust(ctx.pb.resolve(tier, p, profile)?), agent))
             })
             .collect();
-        let api: Vec<(ModelRef, Arc<dyn Llm>)> = order
-            .iter()
-            .filter(|p| !is_cli_provider(p))
-            .filter_map(|p| {
-                let m = adjust(ctx.pb.resolve(tier, p, profile)?);
-                let llm = hub.llm(&m)?;
-                Some((m, llm))
-            })
-            .collect();
+        // Modelo do tier pedido em cada provedor e, como reserva, os dos tiers vizinhos:
+        // um 503 ("high demand") num modelo passa para outro em vez de derrubar o worker.
+        let mut tiers = vec![tier];
+        tiers.extend(tier.up());
+        if tier_down(tier) != tier {
+            tiers.push(tier_down(tier));
+        }
+        let mut api: Vec<(ModelRef, Arc<dyn Llm>)> = Vec::new();
+        for t in &tiers {
+            for p in order.iter().filter(|p| !is_cli_provider(p)) {
+                let Some(m) = ctx.pb.resolve(*t, p, profile).map(&adjust) else { continue };
+                if api.iter().any(|(x, _)| x.provider == m.provider && x.model == m.model) {
+                    continue;
+                }
+                if let Some(llm) = hub.llm(&m) {
+                    api.push((m, llm));
+                }
+            }
+        }
         let (cli, cli_low) = self.order_by_quota(ctx, cli);
         let (api, api_low) = self.order_by_quota(ctx, api);
         if cli.is_empty() && api.is_empty() {
@@ -1343,7 +1418,10 @@ Resultado da ferramenta:
                 available.join(", ")
             ));
         }
-        let use_cli = (unit.kind == UnitKind::Code && !cli.is_empty()) || api.is_empty();
+        let mut use_cli = (unit.kind == UnitKind::Code && !cli.is_empty()) || api.is_empty();
+        if flip && (if use_cli { !api.is_empty() } else { !cli.is_empty() }) {
+            use_cli = !use_cli;
+        }
         let low = if use_cli { cli_low } else { api_low };
         if low && ctx.policy.on_both_critical == "ask" && !self.confirm_low_quota(ctx).await {
             return Err("A cota está baixa em todos os provedores e você preferiu não continuar.".to_string());
@@ -1443,6 +1521,18 @@ Resultado da ferramenta:
             ),
         }
     }
+}
+
+/// Resposta imediata para uma tarefa (variada, mas estável para o mesmo pedido).
+fn ack_text(request: &str) -> &'static str {
+    const ACKS: &[&str] = &[
+        "Entendido. Já comecei: vou dividir o trabalho em partes e te aviso quando terminar.",
+        "Pode deixar, já estou cuidando disso. Te conto o resultado assim que ficar pronto.",
+        "Certo! Vou distribuir isso entre os meus clones e já volto com o resultado.",
+        "Combinado. Estou planejando agora e começo a executar em seguida; te aviso no fim.",
+    ];
+    let h = request.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)));
+    ACKS[h as usize % ACKS.len()]
 }
 
 #[cfg(test)]

@@ -159,6 +159,10 @@ impl Pet {
         (self.timing.frame_ms(&self.anim) as f64 - self.acc_ms).max(0.0)
     }
 
+    pub fn set_sleep_after(&mut self, secs: u64) {
+        self.sleep_after = secs.max(1) as f64;
+    }
+
     /// Começa fora da tela (o primeiro `appear` toca a entrada).
     pub fn start_hidden(&mut self) {
         self.presence = Presence::Hidden;

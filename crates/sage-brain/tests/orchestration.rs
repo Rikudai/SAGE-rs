@@ -311,7 +311,9 @@ async fn full_run_with_api_and_cli_workers_writes_a_report() {
     assert_eq!(count(&events, |e| matches!(e, SageEvent::Gate { verdict, .. } if verdict == "ok")), 2);
     assert_eq!(count(&events, |e| matches!(e, SageEvent::WorkerTool { ok: true, .. })), 1);
     assert_eq!(count(&events, |e| matches!(e, SageEvent::RunReport { .. })), 1);
-    assert_eq!(count(&events, |e| matches!(e, SageEvent::Reply { .. })), 1);
+    // Uma resposta imediata ("já comecei") e o resultado no fim.
+    assert_eq!(count(&events, |e| matches!(e, SageEvent::Reply { .. })), 2);
+    assert!(matches!(events.iter().find(|e| matches!(e, SageEvent::Reply { .. })), Some(SageEvent::Reply { emotion: Some(e), .. }) if e == "determinado"));
     assert_eq!(count(&events, |e| matches!(e, SageEvent::UserText { .. })), 1);
     assert!(count(&events, |e| matches!(e, SageEvent::Stream { source, .. } if source == "lead")) > 0);
     assert!(count(&events, |e| matches!(e, SageEvent::Stream { source, .. } if source == "ler-main")) > 0);
@@ -438,7 +440,8 @@ async fn stop_run_cancels_a_running_worker() {
                     tx.send(Command::StopRun).await.unwrap();
                 }
                 Ok(SageEvent::RunReport { path: p, .. }) => path = p,
-                Ok(SageEvent::Reply { spoken, .. }) => break (spoken, path),
+                // A primeira resposta é o aviso imediato; espera a do fim (depois do relatório).
+                Ok(SageEvent::Reply { spoken, .. }) if !path.is_empty() => break (spoken, path),
                 Ok(_) => {}
                 Err(e) => panic!("bus: {e}"),
             }

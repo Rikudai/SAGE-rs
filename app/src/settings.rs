@@ -10,23 +10,52 @@ enum Tab {
     Voz,
     Modelos,
     Cerebro,
+    Personalidade,
     Slime,
 }
 
 pub struct SettingsPage {
     draft: Config,
+    /// O que está valendo agora (o último aplicado) e o estado ao abrir a página.
+    applied: Config,
+    baseline: Config,
+    /// Hora da última edição ainda não aplicada (espera o usuário parar de digitar).
+    dirty_since: Option<f64>,
+    last_apply: f64,
     tab: Tab,
     msg: String,
     show_keys: bool,
     new_provider: String,
+    /// Blocos do prompt de personalidade (id, rótulo, padrão, texto) e o selecionado.
+    persona: Vec<(String, String, String, String)>,
+    persona_saved: Vec<String>,
+    persona_sel: usize,
+    persona_dirty: Option<f64>,
 }
 
 impl SettingsPage {
     pub fn new(cfg: &Config) -> Self {
-        Self { draft: cfg.clone(), tab: Tab::Geral, msg: String::new(), show_keys: false, new_provider: String::new() }
+        Self {
+            draft: cfg.clone(),
+            applied: cfg.clone(),
+            baseline: cfg.clone(),
+            dirty_since: None,
+            last_apply: 0.0,
+            persona: Vec::new(),
+            persona_saved: Vec::new(),
+            persona_sel: 0,
+            persona_dirty: None,
+            tab: Tab::Geral, msg: String::new(), show_keys: false, new_provider: String::new() }
     }
 
-    /// Desenha a página; devolve a config nova quando o usuário salva.
+    /// Chamado ao entrar na página: "Desfazer" volta para o que estava agora.
+    pub fn opened(&mut self) {
+        self.baseline = self.applied.clone();
+        self.msg.clear();
+    }
+
+    /// Desenha a página; devolve a config nova assim que uma mudança deve valer
+    /// (na hora para chaves e listas, 0,5 s depois da última tecla nos campos de texto).
     pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Config> {
         let p = theme::palette(ui);
         ui.label(theme::bold("Configurações").size(theme::size::HEADING).color(p.text));
@@ -41,6 +70,7 @@ impl SettingsPage {
                 (Tab::Voz, "Voz"),
                 (Tab::Modelos, "Modelos e chaves"),
                 (Tab::Cerebro, "Cérebro"),
+                (Tab::Personalidade, "Personalidade"),
                 (Tab::Slime, "Slime"),
             ],
         );
@@ -50,6 +80,10 @@ impl SettingsPage {
             Tab::Voz => ("Voz", "Como ele fala (Fish Audio, com Edge TTS de reserva) e como ele ouve você."),
             Tab::Modelos => ("Modelos e chaves", "Chaves de API e modelos por papel. As chaves ficam só neste PC."),
             Tab::Cerebro => ("Cérebro", "O lead planeja e workers mais baratos executam. Ajuste perfil e limites."),
+            Tab::Personalidade => (
+                "Personalidade",
+                "O prompt que define quem o S.A.G.E. é, como pensa e até onde age sozinho. Salva sozinho e vale no próximo pedido.",
+            ),
             Tab::Slime => ("Slime", "O avatar na área de trabalho."),
         };
         let footer_h = 64.0;
@@ -58,12 +92,17 @@ impl SettingsPage {
             theme::card(ui).inner_margin(egui::Margin::same(22)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 theme::section(ui, title, desc);
+                if self.tab == Tab::Personalidade {
+                    self.personalidade(ui);
+                    return;
+                }
                 egui::Grid::new("settings").num_columns(2).spacing([28.0, 14.0]).min_col_width(230.0).show(ui, |ui| {
                     match self.tab {
                         Tab::Geral => self.geral(ui),
                         Tab::Voz => self.voz(ui),
                         Tab::Modelos => self.modelos(ui),
                         Tab::Cerebro => self.cerebro(ui),
+                        Tab::Personalidade => {}
                         Tab::Slime => self.slime(ui),
                     }
                 });
@@ -79,31 +118,130 @@ impl SettingsPage {
         });
         ui.add_space(6.0);
         let mut saved = None;
+        let now = ui.input(|i| i.time);
+        if !same(&self.draft, &self.applied) {
+            let since = *self.dirty_since.get_or_insert(now);
+            let typing = ui.ctx().memory(|m| m.focused().is_some());
+            let ready = if typing { now - since >= 0.5 } else { now - self.last_apply >= 0.15 };
+            if ready {
+                self.last_apply = now;
+                saved = self.apply();
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+            }
+        } else {
+            self.dirty_since = None;
+        }
+        // Digitando: reinicia a espera a cada tecla.
+        if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Key { .. }))) {
+            if self.dirty_since.is_some() {
+                self.dirty_since = Some(now);
+            }
+        }
         ui.separator();
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if theme::primary(ui, "Salvar alterações").clicked() {
-                match self.draft.save(&paths::config_file()) {
-                    Ok(()) => {
-                        self.msg = "Salvo. Atalhos e voz passam a valer quando o S.A.G.E. reiniciar.".into();
-                        saved = Some(self.draft.clone());
-                    }
-                    Err(e) => self.msg = format!("Não consegui salvar o config.json ({e}). Feche outros programas que estejam usando o arquivo e tente de novo."),
-                }
+            let changed = !same(&self.baseline, &self.applied);
+            if ui
+                .add_enabled_ui(changed, |ui| theme::button(ui, theme::Kind::Secondary, "Desfazer alterações"))
+                .inner
+                .clicked()
+            {
+                self.draft = self.baseline.clone();
+                saved = self.apply();
+                self.msg = "Voltei para como estava ao abrir as configurações.".into();
             }
-            if theme::button(ui, theme::Kind::Secondary, "Descartar alterações").clicked() {
-                if let Ok(c) = Config::load_default() {
-                    self.draft = c;
-                }
-                self.msg = "Alterações descartadas.".into();
-            }
-            if !self.msg.is_empty() {
-                let color = if self.msg.starts_with("Não") { p.err } else { p.muted };
-                ui.label(egui::RichText::new(self.msg.clone()).size(13.0).color(color));
-            }
+            let msg = if self.msg.is_empty() { "As mudanças valem na hora e ficam salvas sozinhas." } else { &self.msg };
+            let color = if msg.starts_with("Não") { p.err } else { p.muted };
+            ui.label(egui::RichText::new(msg).size(13.0).color(color));
         });
         saved
+    }
+
+    fn apply(&mut self) -> Option<Config> {
+        self.dirty_since = None;
+        match self.draft.save(&paths::config_file()) {
+            Ok(()) => {
+                self.applied = self.draft.clone();
+                self.msg = "Aplicado e salvo.".into();
+                Some(self.draft.clone())
+            }
+            Err(e) => {
+                // Mesmo sem gravar, a mudança vale nesta sessão.
+                self.applied = self.draft.clone();
+                self.msg = format!("Não consegui salvar o config.json ({e}); a mudança vale só até fechar o S.A.G.E.");
+                Some(self.draft.clone())
+            }
+        }
+    }
+
+    fn personalidade(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        if self.persona.is_empty() {
+            self.persona = sage_core::persona::editable_blocks()
+                .into_iter()
+                .map(|b| (b.id.to_string(), b.label.to_string(), b.default.to_string(), b.text))
+                .collect();
+            self.persona_saved = self.persona.iter().map(|b| b.3.clone()).collect();
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+            for i in 0..self.persona.len() {
+                let kind = if i == self.persona_sel { theme::Kind::Primary } else { theme::Kind::Secondary };
+                let changed = self.persona[i].3.trim() != self.persona[i].2.trim();
+                let label = if changed { format!("{} •", self.persona[i].1) } else { self.persona[i].1.clone() };
+                if theme::pill(ui, kind, &label).clicked() {
+                    self.persona_sel = i;
+                }
+            }
+        });
+        ui.add_space(10.0);
+        let sel = self.persona_sel.min(self.persona.len().saturating_sub(1));
+        let Some(block) = self.persona.get_mut(sel) else { return };
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut block.3)
+                .font(egui::TextStyle::Monospace)
+                .desired_rows(18)
+                .desired_width(f32::INFINITY)
+                .margin(egui::Margin::same(12)),
+        );
+        let now = ui.input(|i| i.time);
+        if resp.changed() {
+            self.persona_dirty = Some(now);
+        }
+        ui.add_space(8.0);
+        let mut msg = String::new();
+        ui.horizontal(|ui| {
+            let is_default = block.3.trim() == block.2.trim();
+            if ui
+                .add_enabled_ui(!is_default, |ui| theme::button(ui, theme::Kind::Secondary, "Restaurar o padrão deste bloco"))
+                .inner
+                .clicked()
+            {
+                block.3 = block.2.clone();
+                self.persona_dirty = Some(now - 10.0);
+            }
+            ui.label(egui::RichText::new(format!("{} caracteres", block.3.chars().count())).size(12.0).color(p.subtle));
+        });
+        if let Some(t) = self.persona_dirty {
+            if now - t >= 0.6 {
+                self.persona_dirty = None;
+                let blocks: Vec<(String, String)> = self.persona.iter().map(|b| (b.0.clone(), b.3.clone())).collect();
+                msg = match sage_core::persona::save_blocks(&blocks) {
+                    Ok(()) => {
+                        self.persona_saved = self.persona.iter().map(|b| b.3.clone()).collect();
+                        "Personalidade salva. Vale a partir do próximo pedido.".into()
+                    }
+                    Err(e) => format!("Não consegui salvar data/persona.json ({e})."),
+                };
+            } else {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+            }
+        }
+        if !msg.is_empty() {
+            self.msg = msg;
+        }
     }
 
     fn geral(&mut self, ui: &mut egui::Ui) {
@@ -138,7 +276,12 @@ impl SettingsPage {
         text(ui, "Edge TTS: voz", &mut d.voice_name);
         text(ui, "Edge TTS: velocidade", &mut d.voice_rate);
         text(ui, "Edge TTS: tom", &mut d.voice_pitch);
+        let before = d.voice_profile.clone();
         combo(ui, "Perfil de voz", &mut d.voice_profile, &["rimuru", "sabio", "classica"]);
+        if d.voice_profile != before {
+            // Trocar de perfil troca a voz da Fish Audio junto.
+            d.fish_audio_reference_id = sage_voice::get_profile(Some(&d.voice_profile)).fish_model_id.to_string();
+        }
         let mut wake = d.wake_words.join(", ");
         field_label(ui, "Palavras de ativação");
         if ui.text_edit_singleline(&mut wake).changed() {
@@ -170,10 +313,13 @@ impl SettingsPage {
         let show = self.show_keys;
         let mut remove = None;
         for (id, p) in self.draft.cloud_providers.iter_mut() {
-            egui::CollapsingHeader::new(format!("{id} {}", if p.enabled { "· ligado" } else { "· desligado" }))
-                .id_salt(id)
-                .show(ui, |ui| {
-                    egui::Grid::new(format!("prov-{id}")).num_columns(2).show(ui, |ui| {
+            let status = if p.enabled { theme::RowStatus::Ok } else { theme::RowStatus::None };
+            let meta = if p.enabled { "ligado" } else { "desligado" };
+            let title = if p.model.is_empty() { id.clone() } else { format!("{id} · {}", p.model) };
+            theme::disclosure(ui, egui::Id::unique(("prov", id.as_str())), false, status, &title, meta, true, |ui| {
+                ui.add_space(4.0);
+                ui.indent(("prov-body", id.as_str()), |ui| {
+                    egui::Grid::new(format!("prov-{id}")).num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
                         check(ui, "Ligado", &mut p.enabled);
                         secret(ui, "Chave", &mut p.api_key, show);
                         text(ui, "Modelo", &mut p.model);
@@ -185,10 +331,14 @@ impl SettingsPage {
                         }
                         ui.end_row();
                     });
+                    ui.add_space(6.0);
                     if theme::button(ui, theme::Kind::Danger, "Remover provedor").clicked() {
                         remove = Some(id.clone());
                     }
                 });
+                ui.add_space(8.0);
+            });
+            ui.add_space(2.0);
         }
         if let Some(id) = remove {
             self.draft.cloud_providers.remove(&id);
@@ -219,6 +369,16 @@ impl SettingsPage {
         ui.add(egui::DragValue::new(&mut cost).range(0.0..=50.0).speed(0.05));
         d.brain_max_cost_usd = Some(cost).filter(|c| *c > 0.0);
         ui.end_row();
+        field_label(ui, "Memória e skills");
+        ui.horizontal(|ui| {
+            if theme::button(ui, theme::Kind::Secondary, "Abrir a memória").clicked() {
+                let _ = std::process::Command::new("explorer").arg(paths::data().join("memory")).spawn();
+            }
+            if theme::button(ui, theme::Kind::Secondary, "Abrir as skills do S.A.G.E.").clicked() {
+                let _ = std::process::Command::new("explorer").arg(paths::root().join("skills")).spawn();
+            }
+        });
+        ui.end_row();
         field_label(ui, "Playbooks");
         if theme::button(ui, theme::Kind::Secondary, "Abrir playbooks.yaml").clicked() {
             let _ = std::process::Command::new("cmd")
@@ -240,6 +400,10 @@ impl SettingsPage {
         slider(ui, "Atividade", &mut d.pet_activity, 0.0..=1.0, 0.6);
         slider(ui, "Raio da coleira (px)", &mut d.pet_leash_radius, 0.0..=800.0, 260.0);
     }
+}
+
+fn same(a: &Config, b: &Config) -> bool {
+    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
 }
 
 fn field_label(ui: &mut egui::Ui, text: &str) {

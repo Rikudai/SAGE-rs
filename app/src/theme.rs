@@ -657,6 +657,101 @@ pub fn status_badge(ui: &mut egui::Ui, color: Color32, text: &str, busy: bool) {
         });
 }
 
+/// Indicador à esquerda de uma linha de acordeão.
+#[derive(Clone, Copy, PartialEq)]
+pub enum RowStatus {
+    None,
+    Busy,
+    Ok,
+    Warn,
+    Err,
+}
+
+fn paint_status(ui: &egui::Ui, p: &Palette, status: RowStatus, c: Pos2) {
+    match status {
+        RowStatus::None => {}
+        RowStatus::Busy => {
+            egui::Spinner::new().size(12.0).color(p.accent).paint_at(ui, Rect::from_center_size(c, Vec2::splat(12.0)));
+        }
+        RowStatus::Ok | RowStatus::Warn | RowStatus::Err => {
+            let col = match status {
+                RowStatus::Ok => p.ok,
+                RowStatus::Warn => p.warn,
+                _ => p.err,
+            };
+            ui.painter().circle_filled(c, 6.0, col.gamma_multiply(0.18));
+            ui.painter().circle_filled(c, 3.2, col);
+        }
+    }
+}
+
+fn paint_chevron(painter: &egui::Painter, c: Pos2, open: f32, color: Color32) {
+    // Seta ">" que gira 90° ao abrir.
+    let a = open * std::f32::consts::FRAC_PI_2;
+    let (s, k) = a.sin_cos();
+    let rot = |x: f32, y: f32| c + Vec2::new(x * k - y * s, x * s + y * k);
+    let st = Stroke::new(1.6, color);
+    painter.line(vec![rot(-2.0, -4.0), rot(2.0, 0.0), rot(-2.0, 4.0)], st);
+}
+
+/// Linha clicável de acordeão no estilo de barra lateral (chevron, status, título com
+/// reticências e informação à direita), com hover, pressão e foco animados. O corpo
+/// abre/fecha animado. Devolve a resposta da linha.
+#[allow(clippy::too_many_arguments)]
+pub fn disclosure(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    default_open: bool,
+    status: RowStatus,
+    title: &str,
+    meta: &str,
+    strong: bool,
+    body: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    let p = palette(ui);
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
+    let h = if strong { 34.0 } else { 30.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if resp.clicked() {
+        state.toggle(ui);
+    }
+    let open = state.openness(ui.ctx());
+    if ui.is_rect_visible(rect) {
+        let t = tactile(ui, &resp, true);
+        let r = CornerRadius::same(8);
+        let fill = mix(p.surface, p.surface_hi, (t.hover * 0.9 + open * 0.35).min(1.0));
+        let fill = mix(fill, p.border, t.press * 0.6);
+        ui.painter().rect_filled(t.rect, r, fill);
+        if t.hover > 0.01 {
+            ui.painter().rect_stroke(t.rect, r, Stroke::new(1.0, p.border.gamma_multiply(t.hover)), egui::StrokeKind::Inside);
+        }
+        focus_ring(ui, &resp, t.rect, r);
+        let cy = t.rect.center().y;
+        let mut x = t.rect.left() + 12.0;
+        paint_chevron(ui.painter(), Pos2::new(x, cy), open, mix(p.subtle, p.text, t.hover));
+        x += 14.0;
+        if status != RowStatus::None {
+            paint_status(ui, &p, status, Pos2::new(x + 5.0, cy));
+            x += 18.0;
+        }
+        let meta_g = ui.painter().layout_no_wrap(meta.to_string(), FontId::proportional(11.5), p.subtle);
+        let right = t.rect.right() - 10.0;
+        if !meta.is_empty() {
+            ui.painter().galley(Pos2::new(right - meta_g.size().x, cy - meta_g.size().y / 2.0), meta_g.clone(), p.subtle);
+        }
+        let max_w = (right - meta_g.size().x - 10.0 - x).max(20.0);
+        let font = if strong { FontId::new(13.5, bold_family()) } else { FontId::proportional(13.0) };
+        let mut job = egui::text::LayoutJob::simple_singleline(title.to_string(), font, p.text);
+        job.wrap = egui::text::TextWrapping { max_width: max_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+        let g = ui.painter().layout_job(job);
+        ui.painter().galley(Pos2::new(x, cy - g.size().y / 2.0), g, p.text);
+    }
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, title));
+    state.show_body_unindented(ui, body);
+    resp
+}
+
 /// Indicador "digitando…" (três pontos que ondulam).
 pub fn typing_dots(ui: &mut egui::Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 14.0), egui::Sense::hover());

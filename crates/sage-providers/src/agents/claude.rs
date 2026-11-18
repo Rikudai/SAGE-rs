@@ -68,8 +68,24 @@ pub(crate) fn build_args(task: &AgentTask) -> Vec<String> {
         AgentMode::Write => "acceptEdits",
     };
     a.extend(["--permission-mode".into(), perm.into()]);
+    if task.mode == AgentMode::Write {
+        // Em `-p` não há quem aprove: libera só comandos de checagem/build comuns,
+        // para o worker conseguir validar o que escreveu (ex.: `node --check`).
+        a.push("--allowedTools".into());
+        a.push(VERIFY_TOOLS.join(","));
+    }
     a
 }
+
+/// Comandos que um worker de escrita pode rodar sem aprovação (Bash e PowerShell).
+const VERIFY_TOOLS: &[&str] = &[
+    "Bash(node:*)", "Bash(npm:*)", "Bash(npx:*)", "Bash(python:*)", "Bash(py:*)", "Bash(pip:*)",
+    "Bash(cargo:*)", "Bash(rustc:*)", "Bash(go:*)", "Bash(dotnet:*)", "Bash(git status:*)",
+    "Bash(git diff:*)", "Bash(git log:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(mkdir:*)",
+    "Bash(test:*)", "Bash(echo:*)", "PowerShell(node:*)", "PowerShell(npm:*)", "PowerShell(npx:*)",
+    "PowerShell(python:*)", "PowerShell(cargo:*)", "PowerShell(Test-Path:*)", "PowerShell(Get-ChildItem:*)",
+    "PowerShell(Get-Content:*)", "PowerShell(New-Item:*)",
+];
 
 #[derive(Default)]
 pub(crate) struct ClaudeParser {
@@ -235,7 +251,7 @@ mod tests {
         let s = a.join(" ");
         assert!(s.starts_with("-p --model claude-haiku-5-5 --output-format stream-json --verbose --include-partial-messages --no-session-persistence --effort low"));
         assert!(s.ends_with("--permission-mode plan"));
-        assert!(build_args(&task(AgentMode::Write)).join(" ").ends_with("--permission-mode acceptEdits"));
+        assert!(build_args(&task(AgentMode::Write)).join(" ").contains("--permission-mode acceptEdits --allowedTools Bash(node:*)"));
         let mut t = task(AgentMode::Write);
         t.resume_session = Some("abc".into());
         let s = build_args(&t).join(" ");

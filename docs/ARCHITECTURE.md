@@ -102,3 +102,22 @@ e `data/persona.json` sobrescreve os editáveis. Nunca usar "Mestre"/"Chefe".
 
 Toolchain `stable-x86_64-pc-windows-gnu` (mingw em `C:\mingw64\bin` no PATH). `cargo build --release`.
 `config/config.json` tem chaves: fica fora do git.
+
+## Memória, skills e uso (2026-11-18)
+
+- **Memória** (`crates/sage-tools/src/memory.rs`), no desenho do ai-memory: páginas
+  markdown em `data/memory/wiki/<tipo>/` (fonte da verdade, editáveis à mão), captura de
+  cada turno em `data/memory/raw/*.jsonl` e no diário do dia, fatos ditos explicitamente
+  ("lembre que…", "eu prefiro…") salvos sem LLM, busca BM25 com bônus para duráveis e
+  para o que é usado, recall injetado no prompt como dados, segredos removidos antes de
+  gravar, diários antigos e nunca usados arquivados (nunca apagados). Ferramentas
+  `memory_save`, `memory_search`, `memory_forget`. `data/memory/` fica fora do git.
+- **Skills** (`crates/sage-tools/src/skills.rs`): catálogo de todos os `SKILL.md` do PC
+  (SAGE, Claude Code, Codex, Antigravity, `~/.agents`) e ferramentas `skills_search`,
+  `skill_read`, `skill_create`. O método do gerador é a skill `skills/skill-creator`
+  (sickn33/antigravity-awesome-skills, Apache 2.0).
+- **Transcrição**: Groq Whisper (`whisper-large-v3-turbo`, ~0,5 s) primeiro, Gemini de reserva.
+- **Uso** (`app/src/usage.rs`): cota restante por provedor (Alethe `alethe-usage.json` +
+  `data/quota.json`) e consumo por modelo das execuções.
+- **Configurações ao vivo**: salvar troca hub, ferramentas, voz, atalhos e slime sem reiniciar;
+  a aba Personalidade edita `data/persona.json`.

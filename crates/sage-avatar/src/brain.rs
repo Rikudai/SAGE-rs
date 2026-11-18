@@ -106,6 +106,13 @@ impl PetBrain {
         Self { mood, free_will, can_walk, pace, next_fidget, next_walk, rng }
     }
 
+    /// Aplica personalidade/atividade/vontade própria/andar novos (configurações ao vivo).
+    pub fn configure(&mut self, personality: &str, activity: f32, free_will: bool, can_walk: bool) {
+        self.pace = (personality_pace(personality) * (0.4 + activity.clamp(0.0, 1.0) * 1.2)).max(0.1);
+        self.free_will = free_will;
+        self.can_walk = can_walk;
+    }
+
     pub fn on_event(&mut self, ev: &BrainEvent) {
         let m = &mut self.mood;
         match ev {
