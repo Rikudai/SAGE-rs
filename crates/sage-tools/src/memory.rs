@@ -621,8 +621,8 @@ mod tests {
     fn redacts_secrets() {
         let t = redact("minha chave é gsk_abcdefghijklmnopqrstu e senha: hunter2");
         assert!(!t.contains("gsk_abc") && !t.contains("hunter2"), "{t}");
-        let u = redact("acesse https://x.googleapis.com/v1beta/models?key=AQ.Ab8RN6K4TR7H3fTIMezB e veja");
-        assert!(!u.contains("Ab8RN6"), "{u}");
+        let u = redact("acesse https://x.googleapis.com/v1beta/models?key=AQ.FakeKeyForTests0000000 e veja");
+        assert!(!u.contains("FakeKeyFor"), "{u}");
         assert!(u.contains("acesse") && u.contains("veja"));
     }
 }
