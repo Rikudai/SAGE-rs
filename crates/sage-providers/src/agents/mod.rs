@@ -31,6 +31,17 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     env_dir("USERPROFILE").or_else(|| env_dir("HOME"))
 }
 
+/// Raízes dos discos existentes (`C:\`, `D:\`...), para o modo de acesso total.
+pub(crate) fn drive_roots() -> Vec<String> {
+    if !cfg!(windows) {
+        return vec!["/".to_string()];
+    }
+    (b'A'..=b'Z')
+        .map(|c| format!("{}:\\", c as char))
+        .filter(|d| Path::new(d).is_dir())
+        .collect()
+}
+
 pub(crate) fn local_app_data() -> Option<PathBuf> {
     env_dir("LOCALAPPDATA")
 }

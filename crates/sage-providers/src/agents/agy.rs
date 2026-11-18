@@ -29,16 +29,21 @@ static AUTH_RE: LazyLock<Regex> =
 pub struct AgyCli {
     exe: Option<PathBuf>,
     default_timeout: u64,
+    full_access: bool,
 }
 
 impl AgyCli {
     pub fn from_config(cfg: &Config) -> Self {
         let exe = cfg.antigravity_enabled.then(|| Self::locate(&cfg.agy_path)).flatten();
-        Self { exe, default_timeout: cfg.cli_timeout_seconds.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS) }
+        Self {
+            exe,
+            default_timeout: cfg.cli_timeout_seconds.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS),
+            full_access: cfg.full_access,
+        }
     }
 
     pub fn with_exe(exe: Option<PathBuf>, default_timeout: u64) -> Self {
-        Self { exe, default_timeout }
+        Self { exe, default_timeout, full_access: false }
     }
 
     fn locate(configured: &str) -> Option<PathBuf> {
@@ -63,12 +68,15 @@ pub(crate) fn cap_prompt(prompt: &str) -> String {
 }
 
 /// Argumentos (sem o executável). Aqui o prompt vai no argumento `--print=`.
-pub(crate) fn build_args(task: &AgentTask) -> Vec<String> {
+pub(crate) fn build_args(task: &AgentTask, full_access: bool) -> Vec<String> {
     let mode = match task.mode {
         AgentMode::ReadOnly => "plan",
         AgentMode::Write => "accept-edits",
     };
     let mut a: Vec<String> = vec!["--output-format".into(), "json".into(), "--mode".into(), mode.into()];
+    if full_access && task.mode == AgentMode::Write {
+        a.push("--dangerously-skip-permissions".into());
+    }
     if !task.model.is_empty() {
         a.extend(["--model".into(), task.model.clone()]);
     }
@@ -195,7 +203,7 @@ impl AgentCli for AgyCli {
 
     async fn run(&self, task: AgentTask, sink: Option<DeltaSink>) -> anyhow::Result<AgentOutcome> {
         let exe = self.exe.as_ref().context("o CLI do Antigravity (agy) não foi encontrado")?;
-        let args = build_args(&task);
+        let args = build_args(&task, self.full_access);
         let timeout = if task.timeout_secs > 0 { task.timeout_secs } else { self.default_timeout };
         let started = Instant::now();
         let mut parser = AgyParser::default();
@@ -229,12 +237,12 @@ mod tests {
 
     #[test]
     fn argv_and_cap() {
-        let a = build_args(&task(AgentMode::ReadOnly, "olá"));
+        let a = build_args(&task(AgentMode::ReadOnly, "olá"), false);
         assert_eq!(
             a,
             ["--output-format", "json", "--mode", "plan", "--model", "gemini-3.8-flash-high", "--print=olá"]
         );
-        assert_eq!(build_args(&task(AgentMode::Write, "x"))[3], "accept-edits");
+        assert_eq!(build_args(&task(AgentMode::Write, "x"), false)[3], "accept-edits");
         let long = "á".repeat(20_000);
         let capped = cap_prompt(&long);
         assert_eq!(capped.chars().count(), MAX_PROMPT_CHARS);

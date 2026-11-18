@@ -156,6 +156,14 @@ pub struct Config {
     pub enable_shell_tools: bool,
     #[serde(default)]
     pub shell_timeout_seconds: Option<u64>,
+    /// Acesso total ao PC: workers CLI sem pedir aprovação e com todos os discos,
+    /// PowerShell sem a lista de comandos de sistema bloqueados (desligar, git, registro)
+    /// e ações sem confirmação. Só o que apaga discos inteiros continua barrado.
+    #[serde(default = "t")]
+    pub full_access: bool,
+    /// Atualização ao abrir: "auto" (baixa, compila e deixa pronta), "check" (só avisa) ou "off".
+    #[serde(default = "update_mode_default")]
+    pub update_on_start: String,
 
     // ---- pet
     #[serde(default = "t")]
@@ -194,6 +202,10 @@ pub struct Config {
     /// Every other key of the old config.json, preserved on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+fn update_mode_default() -> String {
+    "auto".to_string()
 }
 
 impl Default for Config {

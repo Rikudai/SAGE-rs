@@ -23,6 +23,7 @@ static AUTH_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub struct CodexCli {
     exe: Option<PathBuf>,
     default_timeout: u64,
+    full_access: bool,
 }
 
 impl CodexCli {
@@ -32,19 +33,24 @@ impl CodexCli {
             cands.push(appdata.join("npm").join("codex.cmd"));
         }
         let exe = find_exe("", &cands, &["codex", "codex.exe", "codex.cmd"]);
-        Self { exe, default_timeout: cfg.cli_timeout_seconds.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS) }
+        Self {
+            exe,
+            default_timeout: cfg.cli_timeout_seconds.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS),
+            full_access: cfg.full_access,
+        }
     }
 
     pub fn with_exe(exe: Option<PathBuf>, default_timeout: u64) -> Self {
-        Self { exe, default_timeout }
+        Self { exe, default_timeout, full_access: false }
     }
 }
 
 /// Argumentos (sem o executável). O prompt vai no stdin (`-`).
-pub(crate) fn build_args(task: &AgentTask) -> Vec<String> {
-    let sandbox = match task.mode {
-        AgentMode::ReadOnly => "read-only",
-        AgentMode::Write => "workspace-write",
+pub(crate) fn build_args(task: &AgentTask, full_access: bool) -> Vec<String> {
+    let sandbox = match (task.mode, full_access) {
+        (AgentMode::ReadOnly, _) => "read-only",
+        (AgentMode::Write, true) => "danger-full-access",
+        (AgentMode::Write, false) => "workspace-write",
     };
     let mut a: Vec<String> = vec!["exec".into()];
     if let Some(id) = &task.resume_session {
@@ -178,7 +184,7 @@ impl AgentCli for CodexCli {
 
     async fn run(&self, task: AgentTask, sink: Option<DeltaSink>) -> anyhow::Result<AgentOutcome> {
         let exe = self.exe.as_ref().context("o CLI do Codex não foi encontrado")?;
-        let args = build_args(&task);
+        let args = build_args(&task, self.full_access);
         let timeout = if task.timeout_secs > 0 { task.timeout_secs } else { self.default_timeout };
         let started = Instant::now();
         let mut parser = CodexParser::default();
@@ -213,15 +219,16 @@ mod tests {
 
     #[test]
     fn argv() {
-        let s = build_args(&task(AgentMode::ReadOnly)).join(" ");
+        let s = build_args(&task(AgentMode::ReadOnly), false).join(" ");
         assert_eq!(
             s,
             "exec --json --model gpt-5.5 -c model_reasoning_effort=high --sandbox read-only --skip-git-repo-check -C C:/proj -"
         );
-        assert!(build_args(&task(AgentMode::Write)).join(" ").contains("--sandbox workspace-write"));
+        assert!(build_args(&task(AgentMode::Write), false).join(" ").contains("--sandbox workspace-write"));
+        assert!(build_args(&task(AgentMode::Write), true).join(" ").contains("--sandbox danger-full-access"));
         let mut t = task(AgentMode::Write);
         t.resume_session = Some("th-1".into());
-        let s = build_args(&t).join(" ");
+        let s = build_args(&t, false).join(" ");
         assert!(s.starts_with("exec resume th-1 --json"));
         assert!(s.contains("sandbox_mode=\"workspace-write\"") && !s.contains("-C "));
     }

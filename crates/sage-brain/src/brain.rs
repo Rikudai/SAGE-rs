@@ -160,6 +160,7 @@ struct CfgView {
     /// `model_config.brain` + `fallbacks`, a fallback lead chain.
     brain_chain: Vec<ModelRef>,
     fast: Option<ModelRef>,
+    full_access: bool,
 }
 
 fn usable_ref(m: &ModelRef) -> bool {
@@ -179,6 +180,7 @@ fn cfg_view(cfg: &Config) -> CfgView {
         agent_dirs: cfg.claude_agent_dirs.clone(),
         brain_chain,
         fast: Some(cfg.model_config.fast.clone()).filter(usable_ref),
+        full_access: cfg.full_access,
     }
 }
 
@@ -545,8 +547,18 @@ impl Brain {
 
     /// Acrescenta ao prompt de sistema o que a memória lembrou para este pedido.
     fn with_memory(&self, system: String) -> String {
+        let system = self.with_access(system);
         let recall = lock(&self.inner.recall).clone();
         if recall.trim().is_empty() { system } else { format!("{system}\n\n{recall}") }
+    }
+
+    /// Acrescenta o lembrete de acesso total quando ele está ligado.
+    fn with_access(&self, system: String) -> String {
+        if self.cfg_view().full_access {
+            format!("{system}\n\n{}", sage_core::persona::access_rules())
+        } else {
+            system
+        }
     }
 
     fn notice(&self, text: &str) {
@@ -1278,7 +1290,7 @@ Resultado da ferramenta:
         flip: bool,
     ) -> Result<(WorkerRun, Tier), String> {
         let (selection, tier) = self.select_models(ctx, unit, tier, flip).await?;
-        let persona = self.inner.prompts.worker(&worker::role_text(unit));
+        let persona = self.with_access(self.inner.prompts.worker(&worker::role_text(unit)));
         let run = match selection {
             Selection::Api(models) => {
                 let first = models.first().map(|(m, _)| m.label()).unwrap_or_default();

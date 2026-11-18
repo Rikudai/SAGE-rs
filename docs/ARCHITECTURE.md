@@ -121,3 +121,22 @@ Toolchain `stable-x86_64-pc-windows-gnu` (mingw em `C:\mingw64\bin` no PATH). `c
   `data/quota.json`) e consumo por modelo das execuções.
 - **Configurações ao vivo**: salvar troca hub, ferramentas, voz, atalhos e slime sem reiniciar;
   a aba Personalidade edita `data/persona.json`.
+
+## Acesso total, auto-atualização e outro PC (2026-11-18)
+
+- **Acesso total** (`full_access`, padrão ligado; Configurações → Geral): workers do Claude em
+  `bypassPermissions` com `--add-dir` de todos os discos, Codex em `danger-full-access`, Antigravity
+  com `--dangerously-skip-permissions`; o `run_powershell` só barra o que apaga disco/partição inteira
+  (`safety.rs`: `CATASTROPHIC` sempre, `GUARDED` só sem acesso total); nenhuma ferramenta pede
+  confirmação; os prompts levam `persona::access_rules()`. Ferramenta `power` (desligar, reiniciar,
+  suspender, cancelar).
+- **Auto-atualização** (`sage-tools/src/update.rs`, porte do `self_update.py`): `sage_update`
+  (fetch → `pull --ff-only` → `cargo build --release -p sage` → instala `sage.exe`, renomeando o que
+  roda para `sage.old.exe`; se não compilar, `git reset --keep`), `sage_restart`, `sage_publish`
+  (commit + push recusando diff com chave de API do config, e `sage.exe` no release `sage-latest`).
+  `update_on_start` = auto | check | off, 20 s depois de abrir. Novidades em
+  `data/ultima_atualizacao.json` entram no recall. Skill: `skills/sage-auto-update`.
+- **Outro PC**: `scripts/chaves-exportar.ps1` cria `config/secrets.enc` (PBKDF2-SHA256 600k →
+  AES-256-CBC + HMAC-SHA256) com o `config.json` e a memória; `scripts/instalar.ps1` restaura, pega o
+  exe (build ou release) e faz abrir com o Windows; `scripts/iniciar-como-admin.ps1` troca o atalho
+  da pasta Inicializar por uma tarefa agendada com privilégios mais altos (admin sem UAC a cada vez).

@@ -102,6 +102,7 @@ impl Runtime {
         let extra: Vec<Arc<dyn Toolbox>> = vec![
             Arc::new(sage_tools::memory::MemoryTools(memory.clone())),
             Arc::new(sage_tools::skills::SkillTools(skills)),
+            Arc::new(sage_tools::update::UpdateTools { root: sage_core::paths::root().to_path_buf() }),
         ];
         let pc: Arc<dyn Toolbox> = Arc::new(sage_tools::PcToolbox::new(&snapshot));
         let swap_tools = Arc::new(SwapTools(RwLock::new(Arc::new(SageTools { pc, extra: extra.clone() }))));
@@ -136,6 +137,8 @@ impl Runtime {
                 }
             });
         }
+
+        startup_update(&rt, &snapshot, bus.clone());
 
         Ok(Self { rt, bus, cmd: tx, voice, hub: swap_hub, tools: swap_tools, memory, extra })
     }
@@ -190,4 +193,49 @@ impl Runtime {
             }
         });
     }
+}
+
+/// Ao abrir: procura a versão nova no GitHub (porte do `startup_check` do SAGE antigo).
+/// "auto" baixa, compila e instala (vale no próximo reinício); "check" só avisa; "off" nada.
+/// Roda em segundo plano, depois de a janela abrir, e nunca atrapalha a abertura.
+fn startup_update(rt: &tokio::runtime::Runtime, cfg: &Config, bus: EventBus) {
+    use sage_tools::update;
+    let mode = cfg.update_on_start.trim().to_lowercase();
+    let skip = std::env::var("SAGE_SKIP_UPDATE").is_ok_and(|v| matches!(v.trim(), "1" | "true" | "sim"));
+    let root = sage_core::paths::root().to_path_buf();
+    if mode == "off" || skip || !root.join(".git").exists() {
+        return;
+    }
+    rt.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let st = match update::status(&root, 30).await {
+            Ok(s) => s,
+            Err(e) => {
+                update::log_line(&root, &format!("[ao abrir] não consegui verificar: {e}"));
+                return;
+            }
+        };
+        if st.incoming.is_empty() {
+            update::log_line(&root, "[ao abrir] já estou na versão mais nova");
+            return;
+        }
+        let n = st.incoming.len();
+        let titles = st.incoming.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        if mode == "check" || st.ahead > 0 {
+            let why = if st.ahead > 0 { " (tenho commits locais que não estão lá, então não apliquei)" } else { "" };
+            let text = format!("Tem {n} atualização(ões) no GitHub{why}: {titles}. Diga \"se atualize\" para eu instalar.");
+            update::log_line(&root, &format!("[ao abrir] {text}"));
+            bus.emit(SageEvent::Notice { text });
+            return;
+        }
+        bus.emit(SageEvent::Notice { text: format!("Baixando {n} novidade(s) do GitHub: {titles}...") });
+        let r = update::apply(&root).await;
+        update::log_line(&root, &format!("[ao abrir] {}", r.message));
+        let text = if r.ok && r.changed {
+            format!("{} Diga \"reinicie\" quando quiser.", r.message)
+        } else {
+            r.message
+        };
+        bus.emit(SageEvent::Notice { text });
+    });
 }

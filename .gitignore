@@ -12,3 +12,7 @@ data/legacy/
 /target-*
 /sage.exe
 data/memory/
+/sage.old.exe
+data/pet_mood.json
+data/ultima_atualizacao.json
+.claude/settings.local.json

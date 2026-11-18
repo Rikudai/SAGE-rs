@@ -1,10 +1,20 @@
 {
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
-      "Bash(cargo build:*)", "Bash(cargo test:*)", "Bash(cargo clippy:*)", "Bash(cargo check:*)", "Bash(cargo fmt:*)", "Bash(cargo tree:*)", "Bash(cargo add:*)", "Bash(cargo metadata:*)", "Bash(cargo run --example:*)",
-      "PowerShell(cargo build*)", "PowerShell(cargo test*)", "PowerShell(cargo clippy*)", "PowerShell(cargo check*)", "PowerShell(cargo fmt*)", "PowerShell(cargo tree*)", "PowerShell(cargo add*)",
-      "Bash(ls:*)", "Bash(cat:*)", "Bash(grep:*)", "Bash(find:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)",
-      "Read(**)", "Glob(**)", "Grep(**)"
-    ]
+      "Bash",
+      "PowerShell",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "WebSearch",
+      "NotebookEdit",
+      "mcp__desktop",
+      "mcp__filesystem"
+    ],
+    "additionalDirectories": ["C:\\"]
   }
 }

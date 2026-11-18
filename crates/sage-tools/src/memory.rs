@@ -307,7 +307,16 @@ use quando ajudar e não cite que veio da memória a menos que perguntem):\n{tex
 
 impl MemoryHook for MemoryStore {
     fn recall(&self, query: &str) -> String {
-        self.recall_block(query)
+        // Pedidos sobre novidades ganham também o que veio na última auto-atualização.
+        let news = crate::update::update_context(sage_core::paths::root(), query);
+        let mem = self.recall_block(query);
+        match (mem.is_empty(), news.is_empty()) {
+            (_, true) => mem,
+            (true, false) => news,
+            (false, false) => format!("{mem}
+
+{news}"),
+        }
     }
     fn observe(&self, user: &str, reply: &str) {
         self.record_turn(user, reply);

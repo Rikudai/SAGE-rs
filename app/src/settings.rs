@@ -254,6 +254,8 @@ impl SettingsPage {
         ui.end_row();
         check(ui, "Ações no PC (ferramentas)", &mut d.enable_actions);
         check(ui, "PowerShell liberado", &mut d.enable_shell_tools);
+        check(ui, "Acesso total ao PC (sem pedir aprovação)", &mut d.full_access);
+        combo(ui, "Atualizar ao abrir (auto, check, off)", &mut d.update_on_start, &["auto", "check", "off"]);
         field_label(ui, "Atalho: segurar para falar");
         ui.text_edit_singleline(&mut d.hotkey_listen);
         ui.end_row();

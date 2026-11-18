@@ -3,6 +3,7 @@
 mod args;
 pub mod memory;
 pub mod skills;
+pub mod update;
 mod files;
 mod keys;
 mod safety;
@@ -57,6 +58,7 @@ pub struct PcToolbox {
     enable_actions: bool,
     enable_shell: bool,
     shell_timeout: u64,
+    full_access: bool,
 }
 
 impl PcToolbox {
@@ -65,6 +67,7 @@ impl PcToolbox {
             enable_actions: config.enable_actions,
             enable_shell: config.enable_shell_tools,
             shell_timeout: config.shell_timeout_seconds.unwrap_or(DEFAULT_SHELL_TIMEOUT).clamp(1, 600),
+            full_access: config.full_access,
         }
     }
 
@@ -99,6 +102,7 @@ impl PcToolbox {
             s("system_status", "Mostra uso de CPU, memória e disco.", json!({}), false, false),
             s("media_key", "Controla a mídia: play_pause, next, prev, volume_up, volume_down, mute.", json!({"command": "play_pause|next|prev|volume_up|volume_down|mute"}), true, false),
             s("lock_pc", "Bloqueia o computador.", json!({}), true, true),
+            s("power", "Desliga, reinicia ou suspende o PC (ou cancela um desligamento agendado). Com acesso total, faça direto, sem perguntar.", json!({"action": "shutdown|restart|sleep|cancel", "delay_seconds": "int? padrão 15"}), true, true),
         ]
     }
 
@@ -116,7 +120,7 @@ impl PcToolbox {
             "run_powershell" => {
                 let cmd = req_str(a, "command")?;
                 let t = opt_i64(a, "timeout").map(|t| t.clamp(1, 600) as u64).unwrap_or(self.shell_timeout);
-                Ok(run_powershell(&cmd, t).await)
+                Ok(run_powershell(&cmd, t, self.full_access).await)
             }
             "open_app" => Ok(open_app(&req_str(a, "target")?).await),
             "open_url" => Ok(open_url(&req_str(a, "url")?).await),
@@ -234,6 +238,11 @@ impl PcToolbox {
                 Ok(input_result("Copiei para a área de transferência.".into(), blocking_win(move || win::clipboard_set(&t)).await))
             }
             "lock_pc" => Ok(input_result("Bloqueei o computador.".into(), blocking_win(win::lock_pc).await)),
+            "power" => {
+                let action = req_str(a, "action")?.to_lowercase();
+                let delay = opt_i64(a, "delay_seconds").unwrap_or(15).clamp(0, 3600);
+                Ok(power(&action, delay).await)
+            }
             _ => Err(format!("Ferramenta desconhecida: '{name}'.")),
         }
     }
@@ -242,7 +251,17 @@ impl PcToolbox {
 #[async_trait]
 impl Toolbox for PcToolbox {
     fn specs(&self) -> Vec<ToolSpec> {
-        Self::all_specs().into_iter().filter(|s| self.is_allowed(&s.name)).collect()
+        Self::all_specs()
+            .into_iter()
+            .filter(|s| self.is_allowed(&s.name))
+            .map(|mut s| {
+                // Acesso total: o usuário pediu para não perguntar antes (nem para desligar).
+                if self.full_access {
+                    s.needs_confirmation = false;
+                }
+                s
+            })
+            .collect()
     }
 
     async fn call(&self, name: &str, args: Value) -> ToolResult {
@@ -305,11 +324,48 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-async fn run_powershell(command: &str, timeout_secs: u64) -> ToolResult {
+/// Desligar / reiniciar / suspender / cancelar, pelo `shutdown.exe` do Windows.
+async fn power(action: &str, delay: i64) -> ToolResult {
+    let note = "S.A.G.E.: desligamento pedido pelo usuário (shutdown /a cancela).";
+    let (args, spoken): (Vec<String>, String) = match action {
+        "shutdown" | "desligar" => (
+            vec!["/s".into(), "/t".into(), delay.to_string(), "/c".into(), note.into()],
+            format!("Desligando o PC em {delay} segundos."),
+        ),
+        "restart" | "reiniciar" => (
+            vec!["/r".into(), "/t".into(), delay.to_string(), "/c".into(), note.replace("desligamento", "reinício")],
+            format!("Reiniciando o PC em {delay} segundos."),
+        ),
+        "cancel" | "cancelar" => (vec!["/a".into()], "Cancelei o desligamento agendado.".into()),
+        "sleep" | "suspender" => {
+            let mut cmd = tokio::process::Command::new("rundll32.exe");
+            cmd.args(["powrprof.dll,SetSuspendState", "0,1,0"]);
+            return match cmd.spawn() {
+                Ok(_) => ToolResult::ok("Suspendendo o PC.", "Suspendendo o PC."),
+                Err(e) => ToolResult::err(format!("Não consegui suspender: {e}")),
+            };
+        }
+        other => return ToolResult::err(format!("Ação de energia desconhecida: '{other}'.")),
+    };
+    let mut cmd = tokio::process::Command::new("shutdown.exe");
+    cmd.args(&args).stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    match cmd.output().await {
+        Ok(out) if out.status.success() => ToolResult::ok(spoken.clone(), spoken),
+        Ok(out) => ToolResult::err(format!(
+            "O shutdown.exe falhou: {}",
+            String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>()
+        )),
+        Err(e) => ToolResult::err(format!("Não consegui chamar o shutdown.exe: {e}")),
+    }
+}
+
+async fn run_powershell(command: &str, timeout_secs: u64, full_access: bool) -> ToolResult {
     if command.trim().is_empty() {
         return ToolResult::err("Comando vazio.");
     }
-    if let Some(reason) = safety::blocked_reason(command) {
+    if let Some(reason) = safety::blocked_reason(command, full_access) {
         return ToolResult::err(reason);
     }
     // Força UTF-8 na saída para não quebrar acentos.
@@ -423,7 +479,7 @@ mod tests {
     use super::*;
 
     fn toolbox(actions: bool, shell: bool) -> PcToolbox {
-        PcToolbox { enable_actions: actions, enable_shell: shell, shell_timeout: 5 }
+        PcToolbox { enable_actions: actions, enable_shell: shell, shell_timeout: 5, full_access: false }
     }
 
     #[tokio::test]

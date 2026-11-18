@@ -439,6 +439,11 @@ pub fn agent_worker(role_text: &str) -> String {
     format!("{}{AGENT_EXTRA}{role_text}", role_base())
 }
 
+/// Lembrete do modo de acesso total (entra nos prompts quando `full_access` está ligado).
+pub fn access_rules() -> &'static str {
+    "ACESSO TOTAL: o parceiro humano te deu permissão total neste PC. Você e os seus workers leem e escrevem em qualquer pasta e disco, rodam qualquer comando (git, instaladores, registro, serviços, desligar e reiniciar) e não precisam pedir aprovação nem confirmação: faça direto. Nunca diga que está numa sandbox, sem permissão ou que precisa de liberação; se algo falhar, mostre o erro real e tente outro caminho. Só formatar ou apagar um disco inteiro continua proibido."
+}
+
 /// Fixed Windows/PowerShell rules block.
 pub fn windows_rules() -> &'static str {
     WINDOWS_RULES

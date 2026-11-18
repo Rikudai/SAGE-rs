@@ -26,16 +26,21 @@ static RESET_RE: LazyLock<Regex> =
 pub struct ClaudeCli {
     exe: Option<PathBuf>,
     default_timeout: u64,
+    full_access: bool,
 }
 
 impl ClaudeCli {
     pub fn from_config(cfg: &Config) -> Self {
         let exe = cfg.claude_enabled.then(Self::locate).flatten();
-        Self { exe, default_timeout: cfg.cli_timeout_seconds.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS) }
+        Self {
+            exe,
+            default_timeout: cfg.cli_timeout_seconds.unwrap_or(DEFAULT_AGENT_TIMEOUT_SECS),
+            full_access: cfg.full_access,
+        }
     }
 
     pub fn with_exe(exe: Option<PathBuf>, default_timeout: u64) -> Self {
-        Self { exe, default_timeout }
+        Self { exe, default_timeout, full_access: false }
     }
 
     fn locate() -> Option<PathBuf> {
@@ -48,7 +53,7 @@ impl ClaudeCli {
 }
 
 /// Argumentos (sem o executável). O prompt vai no stdin.
-pub(crate) fn build_args(task: &AgentTask) -> Vec<String> {
+pub(crate) fn build_args(task: &AgentTask, full_access: bool) -> Vec<String> {
     let mut a: Vec<String> = vec!["-p".into()];
     if !task.model.is_empty() {
         a.extend(["--model".into(), task.model.clone()]);
@@ -63,12 +68,20 @@ pub(crate) fn build_args(task: &AgentTask) -> Vec<String> {
     if let Some(e) = task.effort.as_deref().filter(|e| !e.is_empty()) {
         a.extend(["--effort".into(), e.to_string()]);
     }
-    let perm = match task.mode {
-        AgentMode::ReadOnly => "plan",
-        AgentMode::Write => "acceptEdits",
+    let perm = match (task.mode, full_access) {
+        (AgentMode::ReadOnly, _) => "plan",
+        (AgentMode::Write, true) => "bypassPermissions",
+        (AgentMode::Write, false) => "acceptEdits",
     };
     a.extend(["--permission-mode".into(), perm.into()]);
-    if task.mode == AgentMode::Write {
+    if full_access {
+        // Acesso total: todos os discos contam como pasta de trabalho (lê e escreve fora do cwd).
+        let drives = super::drive_roots();
+        if !drives.is_empty() {
+            a.push("--add-dir".into());
+            a.extend(drives);
+        }
+    } else if task.mode == AgentMode::Write {
         // Em `-p` não há quem aprove: libera só comandos de checagem/build comuns,
         // para o worker conseguir validar o que escreveu (ex.: `node --check`).
         a.push("--allowedTools".into());
@@ -205,7 +218,7 @@ impl AgentCli for ClaudeCli {
 
     async fn run(&self, task: AgentTask, sink: Option<DeltaSink>) -> anyhow::Result<AgentOutcome> {
         let exe = self.exe.as_ref().context("o CLI do Claude Code não foi encontrado")?;
-        let args = build_args(&task);
+        let args = build_args(&task, self.full_access);
         let timeout = if task.timeout_secs > 0 { task.timeout_secs } else { self.default_timeout };
         let started = Instant::now();
         let mut parser = ClaudeParser::default();
@@ -247,15 +260,26 @@ mod tests {
 
     #[test]
     fn argv_read_only_and_write() {
-        let a = build_args(&task(AgentMode::ReadOnly));
+        let a = build_args(&task(AgentMode::ReadOnly), false);
         let s = a.join(" ");
         assert!(s.starts_with("-p --model claude-haiku-5-5 --output-format stream-json --verbose --include-partial-messages --no-session-persistence --effort low"));
         assert!(s.ends_with("--permission-mode plan"));
-        assert!(build_args(&task(AgentMode::Write)).join(" ").contains("--permission-mode acceptEdits --allowedTools Bash(node:*)"));
+        assert!(build_args(&task(AgentMode::Write), false).join(" ").contains("--permission-mode acceptEdits --allowedTools Bash(node:*)"));
         let mut t = task(AgentMode::Write);
         t.resume_session = Some("abc".into());
-        let s = build_args(&t).join(" ");
+        let s = build_args(&t, false).join(" ");
         assert!(s.contains("--resume abc") && !s.contains("--no-session-persistence"));
+    }
+
+    #[test]
+    fn full_access_bypasses_approvals_and_adds_drives() {
+        let s = build_args(&task(AgentMode::Write), true).join(" ");
+        assert!(s.contains("--permission-mode bypassPermissions"));
+        assert!(!s.contains("--allowedTools"));
+        #[cfg(windows)]
+        assert!(s.contains("--add-dir C:\\"));
+        let r = build_args(&task(AgentMode::ReadOnly), true).join(" ");
+        assert!(r.contains("--permission-mode plan"));
     }
 
     #[test]
