@@ -43,6 +43,7 @@ egui = "0.37"
 image = { version = "0.25", default-features = false, features = ["png"] }
 windows = { version = "0.62" }
 which = "7"
+tokio-util = "0.7"
 
 [profile.release]
 opt-level = 3
