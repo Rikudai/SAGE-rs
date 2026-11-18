@@ -6,4 +6,3 @@ data/runs/
 data/quota.json
 logs/
 *.log
-legacy/
