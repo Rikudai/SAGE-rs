@@ -16,3 +16,7 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 futures.workspace = true
+
+[dev-dependencies]
+sage-providers.workspace = true
+sage-tools.workspace = true

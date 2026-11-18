@@ -29,10 +29,13 @@ lead:
   - { provider: gemini, model: gemini-4-hydrogen, effort: high }
   - { provider: groq, model: openai/gpt-oss-120b, effort: high }
   - { provider: gemini, model: gemini-3.6-flash, effort: high }
+  - { provider: gemini, model: gemini-3.1-flash-lite }
+  - { provider: openrouter, model: "openai/gpt-oss-20b:free" }
 # Triage of every request (cheap and fast): chat, a single action, or a task to orchestrate.
 triage:
   - { provider: groq, model: qwen/qwen3.8-27b }
   - { provider: gemini, model: gemini-3.1-flash-lite }
+  - { provider: openrouter, model: "openai/gpt-oss-20b:free" }
 
 tiers:
   cheap:

@@ -44,6 +44,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 windows = { version = "0.62" }
 which = "7"
 tokio-util = "0.7"
+rodio = "0.23"
+cpal = "0.18"
+hound = "3"
+msedge-tts = "0.4"
 
 [profile.release]
 opt-level = 3

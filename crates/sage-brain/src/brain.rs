@@ -670,7 +670,7 @@ impl Brain {
                 self.orchestrate(text, &cfg, cancel).await
             }
             Some(t) if t.kind == TurnKind::Action => match t.action {
-                Some(action) => self.single_action(&action, t.params, &t.reply, t.emotion, cancel).await,
+                Some(action) => self.single_action(text, &cfg, &action, t.params, &t.reply, t.emotion, cancel).await,
                 None if heuristic_task => self.orchestrate(text, &cfg, cancel).await,
                 None => self.chat_reply(text, &cfg, cancel).await,
             },
@@ -726,8 +726,11 @@ impl Brain {
     }
 
     /// One Toolbox call chosen by triage, then a short sentence.
+    #[allow(clippy::too_many_arguments)]
     async fn single_action(
         &self,
+        request: &str,
+        cfg: &CfgView,
         name: &str,
         params: Value,
         reply: &str,
@@ -757,7 +760,16 @@ impl Brain {
             args,
             ok: result.ok,
         });
-        let spoken = if result.ok && !reply.trim().is_empty() {
+        // Ferramenta de consulta: o resultado volta ao modelo, que responde com o dado
+        // de fato (em vez de "vou checar..." dito antes de saber a resposta).
+        let summary = if result.ok && !spec.mutates && !result.details.trim().is_empty() {
+            self.summarize_result(request, name, &result.details, cfg, cancel).await
+        } else {
+            None
+        };
+        let spoken = if let Some(s) = summary.clone() {
+            s
+        } else if result.ok && !reply.trim().is_empty() {
             reply.trim().to_string()
         } else if !result.spoken.trim().is_empty() {
             result.spoken.trim().to_string()
@@ -768,7 +780,7 @@ impl Brain {
         };
         let mut full = spoken.clone();
         let details = result.details.trim();
-        if !details.is_empty() && details != spoken {
+        if !details.is_empty() && details != spoken && summary.is_none() {
             full.push_str(&format!("\n\n```\n{}\n```", clip(details, 4000)));
         }
         TurnOutcome {
@@ -778,6 +790,40 @@ impl Brain {
             emotion: if result.ok { emotion } else { None },
             report: None,
             report_path: None,
+        }
+    }
+
+    /// Resposta curta, na voz do S.A.G.E., a partir do resultado de uma ferramenta de consulta.
+    async fn summarize_result(
+        &self,
+        request: &str,
+        tool: &str,
+        details: &str,
+        cfg: &CfgView,
+        cancel: &CancellationToken,
+    ) -> Option<String> {
+        let pb = self.playbooks();
+        let system = format!(
+            "{}
+
+Você acabou de executar a ferramenta '{tool}' para atender o pedido. Responda ao usuário              com o resultado concreto, em 1 ou 2 frases curtas para serem faladas, sem markdown, sem dizer              que vai checar (já checou) e sem repetir a pergunta.",
+            self.inner.prompts.chat(cfg.user_name.as_deref(), false)
+        );
+        let req = ChatRequest {
+            system,
+            messages: vec![Message::user(format!("Pedido: {request}
+
+Resultado da ferramenta:
+{}", clip(details, 3000)))],
+            temperature: Some(0.3),
+            max_tokens: Some(300),
+            json: false,
+            thinking: None,
+        };
+        let chain = self.triage_chain(&pb, cfg);
+        match self.call_chain(&chain, &req, None, None, cancel).await {
+            Ok((resp, _)) if !resp.text.trim().is_empty() => Some(resp.text.trim().to_string()),
+            _ => None,
         }
     }
 
@@ -1100,7 +1146,18 @@ impl Brain {
                     "A tentativa anterior falhou por infraestrutura ({}); comece do zero.",
                     run.outcome.summary
                 ));
-                if tries.retries == 0 && budget_left { NextStep::Retry } else { NextStep::GiveUp }
+                // Falha do provedor (503, cota): até 2 novas tentativas, com espera crescente,
+                // para dar tempo ao provedor ou ao rodízio da cota escolher outro.
+                if tries.retries < 2 && budget_left {
+                    let wait = Duration::from_secs(4 * (u64::from(tries.retries) + 1));
+                    tokio::select! {
+                        _ = ctx.env.cancel.cancelled() => {}
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                    NextStep::Retry
+                } else {
+                    NextStep::GiveUp
+                }
             } else if let Some(criterion) = unit.gate.as_deref()
                 && budget_left
             {

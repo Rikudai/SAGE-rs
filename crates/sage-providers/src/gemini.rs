@@ -140,7 +140,14 @@ impl GeminiAcc {
     pub fn apply(&mut self, v: &Value, sink: Option<&DeltaSink>) {
         if let Some(parts) = v.pointer("/candidates/0/content/parts").and_then(Value::as_array) {
             for p in parts {
-                let Some(t) = p.get("text").and_then(Value::as_str) else { continue };
+                // Modelos de transcrição (gemini-*-transcribe) devolvem `audioTranscription.text`.
+                let Some(t) = p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| p.pointer("/audioTranscription/text").and_then(Value::as_str))
+                else {
+                    continue;
+                };
                 if t.is_empty() {
                     continue;
                 }
@@ -307,7 +314,9 @@ impl GeminiTranscriber {
         if models.is_empty() {
             return None;
         }
-        Some(Self::new(http, key, models, timeout_from(cfg)))
+        // Áudio demora mais que texto: no mínimo 60 s por modelo.
+        let timeout = timeout_from(cfg).max(Duration::from_secs(60));
+        Some(Self::new(http, key, models, timeout))
     }
 }
 
@@ -344,7 +353,12 @@ impl Transcriber for GeminiTranscriber {
                 let v: Value = resp.json().await.map_err(|e| transport_error(PROVIDER, e, self.timeout))?;
                 let mut acc = GeminiAcc::default();
                 acc.apply(&v, None);
-                Ok(acc.text.trim().to_string())
+                let text = acc.text.trim().to_string();
+                if text.is_empty() {
+                    // Resposta vazia com fala no áudio costuma ser formato inesperado: tenta o próximo modelo.
+                    return Err(LlmError::Provider { provider: PROVIDER.into(), detail: format!("transcrição vazia de {model}") });
+                }
+                Ok(text)
             }
             .await;
             match attempt {
@@ -368,6 +382,14 @@ mod tests {
 
     fn req(system: &str, text: &str) -> ChatRequest {
         ChatRequest { system: system.into(), messages: vec![Message::user(text)], ..Default::default() }
+    }
+
+    #[test]
+    fn reads_audio_transcription_parts() {
+        let v = json!({"candidates":[{"content":{"parts":[{"audioTranscription":{"text":"Olá, Seije."}}]}}]});
+        let mut acc = GeminiAcc::default();
+        acc.apply(&v, None);
+        assert_eq!(acc.text, "Olá, Seije.");
     }
 
     #[test]
