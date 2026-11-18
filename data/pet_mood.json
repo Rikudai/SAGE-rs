@@ -1,6 +1,6 @@
 {
-  "joy": 0.86,
+  "joy": 1.0,
   "affection": 0.86,
   "curiosity": 1.0,
-  "boredom": 1.0
+  "boredom": 0.6
 }
