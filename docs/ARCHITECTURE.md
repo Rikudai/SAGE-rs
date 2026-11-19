@@ -140,3 +140,31 @@ Toolchain `stable-x86_64-pc-windows-gnu` (mingw em `C:\mingw64\bin` no PATH). `c
   AES-256-CBC + HMAC-SHA256) com o `config.json` e a memória; `scripts/instalar.ps1` restaura, pega o
   exe (build ou release) e faz abrir com o Windows; `scripts/iniciar-como-admin.ps1` troca o atalho
   da pasta Inicializar por uma tarefa agendada com privilégios mais altos (admin sem UAC a cada vez).
+
+## Segundo plano, auto-edição e voz local (2026-11-19)
+
+- **Tarefas em segundo plano**: com `Brain::enable_background_tasks` (ligado pelo app), uma
+  tarefa orquestrada vira um `tokio::spawn` (até 3 ao mesmo tempo, `MAX_BACKGROUND_TASKS`); o
+  `ask` devolve na hora (`TurnOutcome.background`) e o chat segue livre. O resultado chega numa
+  `Reply` própria e entra no histórico. O prompt do chat lista as tarefas em andamento. Cada
+  tarefa guarda o `recall` da memória do momento em que começou (`RunCtx.recall`).
+- **Títulos**: o lead devolve `title` junto com o playbook; `PlanReady.title` vai para o painel
+  (sem título, `short_title` tira as palavras de enchimento do pedido).
+- **Cota por modelo**: erro 429 de API (Gemini, Groq, OpenRouter) põe só aquele modelo em
+  descanso (`SharedQuota::observe_model_error`); o bloqueio do provedor inteiro vale só para as
+  CLIs. "Request too large" só pula o modelo.
+- **Auto-edição** (`sage-tools/src/selfedit.rs`, ferramenta `sage_self_edit`): git worktree em
+  `C:\SAGE-dev\upd-*` → agente de código → `cargo build --release` + `cargo test --workspace`
+  (uma rodada de conserto) → commit, `merge --ff-only`, push → `scripts/reiniciar-atualizado.ps1`.
+- **Reinício verificado** (`scripts/reiniciar-atualizado.ps1`): compila e testa (com `-Compilar`),
+  fecha o app, troca o exe (backup em `sage.old.exe`), reabre e espera `data/saude.json` (escrito
+  no primeiro quadro). Sem saúde em 90 s, volta o exe anterior. O resultado vai para
+  `data/resultado_atualizacao.json`, que o app anuncia ("Estou atualizado...").
+- **Imagens coladas**: `Event::PasteImage` (Ctrl+V) → PNG em `data/attachments/`, miniatura no
+  compositor; `Command::Ask.images` leva os caminhos, o cérebro anexa os bytes à mensagem e
+  cita os caminhos no pedido (para os workers).
+- **Avisos**: flutuam no canto (`egui::Area`) e somem em 6 s.
+- **Voz local** (provedor `local`): `tools/voz_local/servidor.py` em 127.0.0.1:5123 (Kokoro
+  `pf_dora` ou Piper `faber`, + RVC opcional com o modelo em `data/voz/rimuru/`). O app abre o
+  servidor sozinho; se falhar, cai para Fish e depois Edge. `gerar_amostras.py` grava a voz do
+  Rimuru da Fish Audio para treinar o RVC.

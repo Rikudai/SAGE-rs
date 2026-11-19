@@ -199,8 +199,93 @@ pub async fn synthesize_edge_tts(
     .map_err(|e| anyhow::anyhow!("Tarefa do Edge TTS falhou: {e}"))?
 }
 
+/// Porta do servidor de voz local (`tools/voz_local/servidor.py`).
+pub const LOCAL_TTS_PORT: u16 = 5123;
+
+static LOCAL_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn local_url(path: &str) -> String {
+    let port = std::env::var("SAGE_VOZ_PORTA").ok().and_then(|p| p.parse().ok()).unwrap_or(LOCAL_TTS_PORT);
+    format!("http://127.0.0.1:{port}{path}")
+}
+
+/// A voz local está instalada (`scripts/voz-local-instalar.ps1` já rodou).
+pub fn local_installed() -> bool {
+    let root = sage_core::paths::root();
+    root.join(".venv-voz").join("Scripts").join("python.exe").is_file()
+        && root.join("tools").join("voz_local").join("servidor.py").is_file()
+}
+
+/// Abre o servidor de voz local (Python do `.venv-voz`) se ele ainda não está no ar.
+/// Devolve false quando a voz local não está instalada.
+pub fn start_local_server() -> bool {
+    let root = sage_core::paths::root();
+    let py = root.join(".venv-voz").join("Scripts").join("python.exe");
+    let script = root.join("tools").join("voz_local").join("servidor.py");
+    if !py.is_file() || !script.is_file() {
+        return false;
+    }
+    if LOCAL_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    let mut cmd = std::process::Command::new(py);
+    cmd.arg(script).current_dir(root).stdin(std::process::Stdio::null());
+    if let Ok(f) = std::fs::File::create(root.join("logs").join("voz_local.log")) {
+        if let Ok(f2) = f.try_clone() {
+            cmd.stdout(f).stderr(f2);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match cmd.spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("[Voz] não consegui abrir a voz local: {e}");
+            LOCAL_STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            false
+        }
+    }
+}
+
+/// Fala pela voz local (sem API externa): WAV do servidor em 127.0.0.1. Abre o servidor
+/// na primeira vez e espera ele carregar o modelo (até ~40 s).
+pub async fn synthesize_local(client: &reqwest::Client, text: &str) -> anyhow::Result<Vec<u8>> {
+    let body = serde_json::json!({ "text": text });
+    let mut waited = 0u64;
+    loop {
+        match client.post(local_url("/tts")).json(&body).timeout(Duration::from_secs(60)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let bytes = resp.bytes().await?;
+                if bytes.is_empty() {
+                    anyhow::bail!("a voz local devolveu áudio vazio");
+                }
+                return Ok(bytes.to_vec());
+            }
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                anyhow::bail!("voz local HTTP {code}: {}", resp.text().await.unwrap_or_default());
+            }
+            Err(e) if e.is_connect() => {
+                if !start_local_server() {
+                    anyhow::bail!("voz local não instalada (rode scripts/voz-local-instalar.ps1)");
+                }
+                if waited >= 40 {
+                    anyhow::bail!("a voz local não respondeu em 40 s (veja logs/voz_local.log)");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                waited += 1;
+            }
+            Err(e) => anyhow::bail!("erro na voz local: {e}"),
+        }
+    }
+}
+
 /// Sintetiza `text` (já preparado) tentando Fish Audio primeiro (quando configurado)
-/// e caindo para Edge TTS em caso de falha.
+/// e caindo para Edge TTS em caso de falha. Com o provedor "local", tenta a voz local
+/// antes de tudo.
 pub async fn synthesize_with_fallback(
     client: &reqwest::Client,
     text: &str,
@@ -208,7 +293,13 @@ pub async fn synthesize_with_fallback(
 ) -> anyhow::Result<Vec<u8>> {
     let resolved = ResolvedVoiceSettings::from_config(cfg);
     let provider = resolved.tts_provider.to_ascii_lowercase();
-    let wants_fish = provider.is_empty() || provider == "fish_audio" || provider == "fish";
+    if provider == "local" {
+        match synthesize_local(client, text).await {
+            Ok(wav) => return Ok(wav),
+            Err(e) => tracing::warn!("[Voz] voz local falhou (usando Fish/Edge): {e}"),
+        }
+    }
+    let wants_fish = provider.is_empty() || provider == "fish_audio" || provider == "fish" || provider == "local";
     let fish_key = if wants_fish {
         resolve_fish_api_key(cfg)
     } else {
@@ -231,6 +322,15 @@ pub async fn synthesize_with_fallback(
                     "[Voz] Aviso na Fish Audio TTS (usando fallback Edge TTS): {e}"
                 );
             }
+        }
+    }
+
+    // Sem Fish (sem chave, sem créditos ou fora do ar): a voz local, se instalada, vem antes
+    // do Edge, que também depende de internet.
+    if provider != "local" && provider != "edge" && local_installed() {
+        match synthesize_local(client, text).await {
+            Ok(wav) => return Ok(wav),
+            Err(e) => tracing::warn!("[Voz] voz local falhou (usando Edge): {e}"),
         }
     }
 

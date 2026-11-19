@@ -271,7 +271,7 @@ impl SettingsPage {
         check(ui, "Voz ligada", &mut d.voice_enabled);
         check(ui, "Cumprimentar ao iniciar", &mut d.speak_greetings);
         check(ui, "Pausar música/vídeo enquanto falo ou ouço", &mut d.pause_media_while_speaking);
-        combo(ui, "Provedor de voz", &mut d.tts_provider, &["fish_audio", "edge"]);
+        combo(ui, "Provedor de voz (local = no PC, sem API)", &mut d.tts_provider, &["local", "fish_audio", "edge"]);
         secret(ui, "Fish Audio: chave", &mut d.fish_audio_api_key, show);
         text(ui, "Fish Audio: voz (reference_id)", &mut d.fish_audio_reference_id);
         text(ui, "Fish Audio: modelo", &mut d.fish_audio_model);

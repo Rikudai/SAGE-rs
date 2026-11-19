@@ -148,6 +148,10 @@ impl Runtime {
 
         startup_update(&rt, &snapshot, bus.clone());
         announce_updates(&rt, bus.clone());
+        if snapshot.tts_provider.eq_ignore_ascii_case("local") {
+            // Já carrega o modelo de voz local, para a primeira fala não demorar.
+            sage_voice::tts::start_local_server();
+        }
 
         Ok(Self { rt, bus, cmd: tx, voice, hub: swap_hub, tools: swap_tools, memory, extra })
     }

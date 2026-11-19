@@ -21,3 +21,5 @@ data/attachments/
 data/saude.json
 data/resultado_atualizacao.json
 data/atualizacao_pendente.json
+/.venv-voz/
+data/voz/
