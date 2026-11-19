@@ -1,8 +1,9 @@
 //! `Brain`: the command loop, triage (chat / one action / task) and the orchestrated run:
 //! pick a playbook, plan, run waves of workers, gate them, synthesize, report.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,8 @@ const LEAD_PHASE: &str = "lead";
 /// `text::complexity` from which a "chat" triage is treated as a task.
 const TASK_COMPLEXITY: f32 = 0.55;
 const TURN_QUEUE: usize = 16;
+/// Tarefas orquestradas ao mesmo tempo em segundo plano (as outras esperam a vez).
+const MAX_BACKGROUND_TASKS: usize = 3;
 const DEFAULT_MAX_UNITS: usize = 12;
 const STOPPED_NOTE: &str = "Parei a execução, como você pediu.";
 
@@ -109,12 +112,14 @@ pub struct TurnOutcome {
     pub emotion: Option<String>,
     pub report: Option<RunReport>,
     pub report_path: Option<PathBuf>,
+    /// A tarefa foi para o segundo plano: o resultado chega depois, numa `Reply` própria.
+    pub background: bool,
 }
 
 impl TurnOutcome {
     fn text(kind: TurnKind, text: impl Into<String>, emotion: Option<String>) -> Self {
         let full = text.into();
-        Self { kind, spoken: full.clone(), full, emotion, report: None, report_path: None }
+        Self { kind, spoken: full.clone(), full, emotion, report: None, report_path: None, background: false }
     }
 }
 
@@ -208,6 +213,8 @@ struct RunCtx {
     cfg: CfgView,
     env: WorkerEnv,
     lead_chain: Vec<ModelRef>,
+    /// O que a memória lembrou quando a tarefa começou (o chat segue mudando o `recall`).
+    recall: String,
     /// The user's answer to "every provider is low, continue?", asked once per run.
     low_quota_ok: tokio::sync::Mutex<Option<bool>>,
 }
@@ -347,6 +354,13 @@ struct Inner {
     /// Memória de longo prazo (opcional) e o que ela lembrou para o pedido atual.
     memory: Option<Arc<dyn MemoryHook>>,
     recall: Mutex<String>,
+    /// Tarefas longas rodam em segundo plano e o chat segue livre (ligado pelo app).
+    background: AtomicBool,
+    /// Tarefas em segundo plano: chave -> (título, cancelamento).
+    bg_runs: Mutex<BTreeMap<String, (String, CancellationToken)>>,
+    bg_slots: Arc<Semaphore>,
+    /// Imagens do pedido atual (vão na última mensagem do usuário).
+    images: Mutex<Vec<Vec<u8>>>,
 }
 
 /// The orchestrator brain. Cheap to clone (shared state).
@@ -409,6 +423,10 @@ impl Brain {
                 settings: opts.settings,
                 memory: opts.memory,
                 recall: Mutex::new(String::new()),
+                background: AtomicBool::new(false),
+                bg_runs: Mutex::new(BTreeMap::new()),
+                bg_slots: Arc::new(Semaphore::new(MAX_BACKGROUND_TASKS)),
+                images: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -430,15 +448,30 @@ impl Brain {
         lock(&self.inner.current).is_some()
     }
 
-    /// Cancels the request in progress (`Command::StopRun`); false when idle.
+    /// Tarefas orquestradas passam a rodar em segundo plano: o S.A.G.E. responde na hora
+    /// e continua conversando (e aceitando novas tarefas) enquanto elas rodam.
+    pub fn enable_background_tasks(&self) {
+        self.inner.background.store(true, Ordering::Relaxed);
+    }
+
+    /// Títulos das tarefas rodando em segundo plano.
+    pub fn background_tasks(&self) -> Vec<String> {
+        lock(&self.inner.bg_runs).values().map(|(t, _)| t.clone()).collect()
+    }
+
+    /// Cancels the request in progress and every background task (`Command::StopRun`);
+    /// false when idle.
     pub fn stop(&self) -> bool {
-        match lock(&self.inner.current).as_ref() {
-            Some(t) => {
-                t.cancel();
-                true
-            }
-            None => false,
+        let mut any = false;
+        if let Some(t) = lock(&self.inner.current).as_ref() {
+            t.cancel();
+            any = true;
         }
+        for (_, t) in lock(&self.inner.bg_runs).values() {
+            t.cancel();
+            any = true;
+        }
+        any
     }
 
     /// Answers a `ConfirmRequest` (`Command::Confirm`).
@@ -459,20 +492,20 @@ impl Brain {
     /// Main loop: consumes commands until the channel closes. Requests run one at a time
     /// on their own task, so `Confirm` and `StopRun` are handled while one is running.
     pub async fn run(self, mut rx: mpsc::Receiver<Command>) {
-        let (turn_tx, mut turn_rx) = mpsc::channel::<(String, bool)>(TURN_QUEUE);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<(String, bool, Vec<String>)>(TURN_QUEUE);
         let brain = self.clone();
         let turns = tokio::spawn(async move {
-            while let Some((text, from_voice)) = turn_rx.recv().await {
-                brain.ask(&text, from_voice).await;
+            while let Some((text, from_voice, images)) = turn_rx.recv().await {
+                brain.ask_with_images(&text, from_voice, &images).await;
             }
         });
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                Command::Ask { text, from_voice } => {
+                Command::Ask { text, from_voice, images } => {
                     if self.is_busy() {
                         self.notice("Anotado; respondo assim que terminar o pedido atual.");
                     }
-                    match turn_tx.try_send((text, from_voice)) {
+                    match turn_tx.try_send((text, from_voice, images)) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             self.notice("Tem pedidos demais na fila; espere eu terminar.");
@@ -504,6 +537,30 @@ impl Brain {
 
     /// Handles one request end to end and emits its `Reply`.
     pub async fn ask(&self, text: &str, from_voice: bool) -> TurnOutcome {
+        self.ask_with_images(text, from_voice, &[]).await
+    }
+
+    /// Igual a `ask`, com imagens coladas no chat (caminhos de PNG): vão para o modelo
+    /// junto com a mensagem, e os caminhos entram no pedido para os workers abrirem.
+    pub async fn ask_with_images(&self, text: &str, from_voice: bool, images: &[String]) -> TurnOutcome {
+        let bytes: Vec<Vec<u8>> = images.iter().filter_map(|p| std::fs::read(p).ok()).collect();
+        *lock(&self.inner.images) = bytes;
+        let with_paths;
+        let text = if images.is_empty() {
+            text
+        } else {
+            let base = if text.trim().is_empty() { "O que você vê nesta imagem?" } else { text.trim() };
+            with_paths = format!("{base}
+
+[Imagens coladas pelo usuário: {}]", images.join(", "));
+            with_paths.as_str()
+        };
+        let out = self.ask_inner(text, from_voice).await;
+        lock(&self.inner.images).clear();
+        out
+    }
+
+    async fn ask_inner(&self, text: &str, from_voice: bool) -> TurnOutcome {
         let text = text.trim();
         let cancel = CancellationToken::new();
         *lock(&self.inner.current) = Some(cancel.clone());
@@ -528,6 +585,12 @@ impl Brain {
             tokio::task::spawn_blocking(move || m.observe(&u, &r));
         }
         *lock(&self.inner.current) = None;
+        if out.background {
+            // A confirmação já foi dita; o resultado vem numa resposta própria.
+            self.push_history(text, "(tarefa iniciada em segundo plano; o resultado chega quando terminar)");
+            self.idle_if_free();
+            return out;
+        }
         if !text.is_empty() {
             self.push_history(text, &out.full);
         }
@@ -539,16 +602,75 @@ impl Brain {
         if let Some(e) = &out.emotion {
             self.inner.bus.emit(SageEvent::Emotion { name: e.clone() });
         }
-        self.inner.bus.status(AppStatus::Idle, "");
+        self.idle_if_free();
         out
+    }
+
+    /// Volta o status para ocioso, ou para "N tarefas em segundo plano".
+    fn idle_if_free(&self) {
+        if self.is_busy() {
+            return;
+        }
+        let n = lock(&self.inner.bg_runs).len();
+        if n == 0 {
+            self.inner.bus.status(AppStatus::Idle, "");
+        } else {
+            let s = if n == 1 { "1 tarefa em segundo plano".to_string() } else { format!("{n} tarefas em segundo plano") };
+            self.inner.bus.status(AppStatus::Idle, s);
+        }
+    }
+
+    /// Orquestra a tarefa: em segundo plano quando ligado (responde na hora e libera o chat),
+    /// senão aqui mesmo.
+    async fn start_task(&self, text: &str, cfg: &CfgView, cancel: &CancellationToken) -> TurnOutcome {
+        let recall = lock(&self.inner.recall).clone();
+        if !self.inner.background.load(Ordering::Relaxed) {
+            return self.orchestrate(text, cfg, cancel, recall).await;
+        }
+        let key = new_run_id();
+        let token = CancellationToken::new();
+        let title = short_title(text);
+        lock(&self.inner.bg_runs).insert(key.clone(), (title, token.clone()));
+        let (me, req, cfg) = (self.clone(), text.to_string(), cfg.clone());
+        tokio::spawn(async move {
+            let permit = me.inner.bg_slots.clone().acquire_owned().await.ok();
+            let out = me.orchestrate(&req, &cfg, &token, recall).await;
+            drop(permit);
+            lock(&me.inner.bg_runs).remove(&key);
+            if let Some(m) = &me.inner.memory {
+                let m = m.clone();
+                let (u, r) = (req.clone(), out.full.clone());
+                tokio::task::spawn_blocking(move || m.observe(&u, &r));
+            }
+            me.push_history(&format!("(resultado da tarefa) {}", clip(&req, 300)), &out.full);
+            me.inner.bus.emit(SageEvent::Reply { spoken: out.spoken.clone(), full: out.full.clone(), emotion: out.emotion.clone() });
+            if let Some(e) = &out.emotion {
+                me.inner.bus.emit(SageEvent::Emotion { name: e.clone() });
+            }
+            me.idle_if_free();
+        });
+        TurnOutcome { background: true, ..TurnOutcome::text(TurnKind::Task, "", None) }
     }
 
     // ------------------------------------------------------------------ helpers
 
     /// Acrescenta ao prompt de sistema o que a memória lembrou para este pedido.
     fn with_memory(&self, system: String) -> String {
-        let system = self.with_access(system);
         let recall = lock(&self.inner.recall).clone();
+        let mut system = self.with_recall(system, &recall);
+        let bg = self.background_tasks();
+        if !bg.is_empty() {
+            system.push_str(&format!(
+                "\n\nTAREFAS RODANDO EM SEGUNDO PLANO AGORA (outras instâncias suas cuidam delas; o resultado chega sozinho): {}. \
+Se o usuário perguntar delas, diga que estão em andamento. Você segue livre para conversar e aceitar novas tarefas.",
+                bg.join("; ")
+            ));
+        }
+        system
+    }
+
+    fn with_recall(&self, system: String, recall: &str) -> String {
+        let system = self.with_access(system);
         if recall.trim().is_empty() { system } else { format!("{system}\n\n{recall}") }
     }
 
@@ -583,6 +705,13 @@ impl Brain {
         chain.extend(cfg.fast.iter().cloned());
         chain.extend(self.lead_chain(pb, cfg));
         dedup(chain)
+    }
+
+    /// A mensagem do usuário com as imagens coladas neste pedido.
+    fn user_message(&self, text: &str) -> Message {
+        let mut m = Message::user(text);
+        m.images = lock(&self.inner.images).clone();
+        m
     }
 
     fn history_messages(&self) -> Vec<Message> {
@@ -630,7 +759,14 @@ impl Brain {
         let usable: Vec<&ModelRef> = chain
             .iter()
             .filter(|m| available.contains(&m.provider))
-            .filter(|m| self.inner.quota.read(|q| q.state(&m.provider, &policy, now)) != QuotaState::Blocked)
+            .filter(|m| {
+                // Modelos de API descansam um a um; o bloqueio do provedor inteiro vale só para as CLIs.
+                if crate::quota::is_api_provider(&m.provider) {
+                    !self.inner.quota.model_resting(m)
+                } else {
+                    self.inner.quota.read(|q| q.state(&m.provider, &policy, now)) != QuotaState::Blocked
+                }
+            })
             .collect();
         let mut last_err: Option<LlmError> = None;
         for (i, m) in usable.iter().enumerate() {
@@ -652,11 +788,17 @@ impl Brain {
                     return Ok((resp, ModelRef::clone(m)));
                 }
                 Err(e) => {
-                    let limited = self.inner.quota.observe_error(&e).is_some();
+                    let limited = if crate::quota::is_api_provider(&m.provider) {
+                        self.inner.quota.observe_model_error(m, &e)
+                    } else {
+                        self.inner.quota.observe_error(&e).is_some()
+                    };
                     if !e.is_transient() {
                         return Err(e);
                     }
-                    if limited && let Some(next) = usable.get(i + 1) {
+                    if limited && let Some(next) = usable.get(i + 1)
+                        && next.provider != m.provider
+                    {
                         self.note_switch(run, &m.provider, &next.provider);
                     }
                     tracing::warn!("modelo {} falhou: {e}", m.label());
@@ -718,13 +860,13 @@ impl Brain {
         match triage {
             Some(t) if t.kind == TurnKind::Task || (t.kind == TurnKind::Chat && heuristic_task) => {
                 self.acknowledge(text, &t.reply);
-                self.orchestrate(text, &cfg, cancel).await
+                self.start_task(text, &cfg, cancel).await
             }
             Some(t) if t.kind == TurnKind::Action => match t.action {
                 Some(action) => self.single_action(text, &cfg, &action, t.params, &t.reply, t.emotion, cancel).await,
                 None if heuristic_task => {
                     self.acknowledge(text, &t.reply);
-                    self.orchestrate(text, &cfg, cancel).await
+                    self.start_task(text, &cfg, cancel).await
                 }
                 None => self.chat_reply(text, &cfg, cancel).await,
             },
@@ -732,7 +874,7 @@ impl Brain {
             Some(_) => self.chat_reply(text, &cfg, cancel).await,
             None if heuristic_task => {
                 self.acknowledge(text, "");
-                self.orchestrate(text, &cfg, cancel).await
+                self.start_task(text, &cfg, cancel).await
             }
             None => self.chat_reply(text, &cfg, cancel).await,
         }
@@ -760,7 +902,7 @@ impl Brain {
             templates::triage_instructions(&specs, &self.inner.prompts.emotions())
         );
         let mut messages = self.history_messages();
-        messages.push(Message::user(text));
+        messages.push(self.user_message(text));
         let req =
             ChatRequest { system, messages, temperature: Some(0.2), max_tokens: Some(1024), json: true, thinking: None };
         let chain = self.triage_chain(&pb, cfg);
@@ -771,7 +913,7 @@ impl Brain {
     async fn chat_reply(&self, text: &str, cfg: &CfgView, cancel: &CancellationToken) -> TurnOutcome {
         let pb = self.playbooks();
         let mut messages = self.history_messages();
-        messages.push(Message::user(text));
+        messages.push(self.user_message(text));
         let req = ChatRequest {
             system: self.with_memory(self.inner.prompts.chat(cfg.user_name.as_deref(), true)),
             messages,
@@ -781,7 +923,7 @@ impl Brain {
             thinking: None,
         };
         let chain = self.triage_chain(&pb, cfg);
-        match self.call_chain(&chain, &req, Some("lead"), None, cancel).await {
+        match self.call_chain(&chain, &req, Some("chat"), None, cancel).await {
             Ok((resp, _)) if !resp.text.trim().is_empty() => TurnOutcome::text(TurnKind::Chat, resp.text.trim(), None),
             Ok(_) => TurnOutcome::text(TurnKind::Chat, "Fiquei sem resposta agora; pode repetir?", None),
             Err(e) => TurnOutcome::text(
@@ -860,6 +1002,7 @@ impl Brain {
             emotion: if result.ok { emotion } else { None },
             report: None,
             report_path: None,
+            background: false,
         }
     }
 
@@ -899,7 +1042,7 @@ Resultado da ferramenta:
 
     // ------------------------------------------------------------------ orchestration
 
-    async fn orchestrate(&self, request: &str, cfg: &CfgView, cancel: &CancellationToken) -> TurnOutcome {
+    async fn orchestrate(&self, request: &str, cfg: &CfgView, cancel: &CancellationToken, recall: String) -> TurnOutcome {
         let started = Instant::now();
         let started_at = Utc::now();
         let pb = self.playbooks();
@@ -926,6 +1069,7 @@ Resultado da ferramenta:
             cfg: cfg.clone(),
             env,
             lead_chain: self.lead_chain(&pb, cfg),
+            recall,
             low_quota_ok: tokio::sync::Mutex::new(None),
         };
         let bus = &self.inner.bus;
@@ -942,6 +1086,7 @@ Resultado da ferramenta:
         let units = if lead_alone { vec![LEAD_UNIT.to_string()] } else { plan.unit_ids() };
         bus.emit(SageEvent::PlanReady {
             run_id: run_id.clone(),
+            title: if choice.title.trim().is_empty() { short_title(request) } else { clip(choice.title.trim(), 60) },
             playbook: choice.playbook.clone(),
             why: choice.why.clone(),
             units,
@@ -1067,11 +1212,11 @@ Resultado da ferramenta:
             usage,
             path: path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
         });
-        TurnOutcome { kind: TurnKind::Task, spoken, full, emotion, report: Some(report), report_path: path }
+        TurnOutcome { kind: TurnKind::Task, spoken, full, emotion, report: Some(report), report_path: path, background: false }
     }
 
     fn lead_system(&self, ctx: &RunCtx) -> String {
-        templates::lead_system(&self.with_memory(self.inner.prompts.lead(ctx.cfg.user_name.as_deref())), &ctx.pb.principles)
+        templates::lead_system(&self.with_recall(self.inner.prompts.lead(ctx.cfg.user_name.as_deref()), &ctx.recall), &ctx.pb.principles)
     }
 
     async fn pick_playbook(&self, ctx: &RunCtx) -> PlaybookChoice {
@@ -1079,6 +1224,7 @@ Resultado da ferramenta:
         let fallback = || PlaybookChoice {
             playbook: pb.default_playbook().unwrap_or_default(),
             why: "Escolha padrão: o lead não respondeu com um playbook válido.".to_string(),
+            title: String::new(),
         };
         if pb.playbooks.is_empty() {
             return fallback();
@@ -1096,7 +1242,7 @@ Resultado da ferramenta:
                 let c: PlaybookChoice = jsonx::parse(text)?;
                 let id = c.playbook.trim().to_string();
                 if pb.playbook(&id).is_some() {
-                    Ok(PlaybookChoice { playbook: id, why: c.why.trim().to_string() })
+                    Ok(PlaybookChoice { playbook: id, why: c.why.trim().to_string(), title: c.title.trim().to_string() })
                 } else {
                     Err(format!("o playbook '{id}' não existe; use um destes: {ids}"))
                 }
@@ -1574,5 +1720,36 @@ mod tests {
         let d = dedup(vec![ModelRef::new("a", "m"), ModelRef::new("a", "m"), ModelRef::new("b", "m")]);
         assert_eq!(d.len(), 2);
         assert!(new_run_id().len() > 16);
+    }
+}
+
+/// Título curto de uma tarefa quando o lead não deu um: as primeiras palavras do pedido,
+/// sem "eu preciso que você", "por favor" e afins.
+pub fn short_title(request: &str) -> String {
+    const FILLER: &[&str] = &[
+        "eu", "preciso", "quero", "que", "você", "voce", "tu", "por", "favor", "faz", "fazendo", "olha", "só",
+        "seiji", "sage", "ai", "aí", "então", "agora", "pra", "mim", "me", "na", "verdade", "cara", "e",
+    ];
+    let words: Vec<&str> = request
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '.' | '!' | '?' | ';' | ':'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let start = words.iter().position(|w| !FILLER.contains(&w.to_lowercase().as_str())).unwrap_or(0);
+    let picked: Vec<&str> = words.iter().skip(start).take(6).copied().collect();
+    let mut t = picked.join(" ");
+    if let Some(c) = t.chars().next() {
+        t = c.to_uppercase().collect::<String>() + &t[c.len_utf8()..];
+    }
+    if t.is_empty() { "Tarefa".to_string() } else { clip(&t, 60) }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::short_title;
+
+    #[test]
+    fn short_title_drops_filler_and_keeps_it_short() {
+        assert_eq!(short_title("eu preciso que tu instale o freecad para mim faz o download"), "Instale o freecad para mim faz");
+        assert_eq!(short_title("   "), "Tarefa");
     }
 }

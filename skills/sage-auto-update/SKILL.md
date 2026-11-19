@@ -57,3 +57,28 @@ Nunca escreva a senha do cofre em arquivos, logs ou commits.
 
 - Não use `git push --force`, `git reset --hard` nem apague `data/` (memória e humor do usuário).
 - Não edite `config/config.json` para publicar; ele fica só neste PC.
+
+## Mudar o próprio código (auto-edição)
+
+Quando o usuário pedir uma mudança **no próprio S.A.G.E.** (função nova, conserto, "se atualize
+para fazer X"), use `sage_self_edit` com o pedido completo. Não edite os arquivos da pasta em
+uso nem mande um worker comum mexer nela.
+
+1. Cria uma cópia isolada (`git worktree` em `C:\SAGE-dev\upd-...`, ramo `sage/upd-...`).
+2. Um agente de código (Codex → Claude → Antigravity, o primeiro com cota) implementa na cópia.
+3. `cargo build --release -p sage` e `cargo test --workspace` na cópia; se falhar, o agente
+   recebe o erro e tenta consertar uma vez.
+4. Testes passando: commit, `merge --ff-only` no `main`, push, e o
+   `scripts\reiniciar-atualizado.ps1` reinicia na versão nova. Testes falhando: nada é
+   aplicado; `sage_self_edit_apply {id}` aplica mesmo assim se o usuário mandar.
+5. O script confere se a versão nova abriu (`data\saude.json`); se não abrir em 90 s, volta a
+   anterior (`sage.old.exe`). Ao reabrir, o S.A.G.E. anuncia o resultado ("Estou atualizado...").
+
+Tudo roda em segundo plano, com as etapas no painel de tarefas; o chat segue respondendo.
+
+## Recompilar e reiniciar
+
+`sage_rebuild_restart` (ou, de fora, `powershell -ExecutionPolicy Bypass -File scripts\reiniciar-atualizado.ps1 -Compilar`):
+compila a pasta atual, roda todos os testes (passando ou não, o resultado é anunciado), fecha o
+S.A.G.E., troca o exe, reabre, confere e diz que está atualizado. Se a compilação falhar, nada é
+trocado e ele avisa.

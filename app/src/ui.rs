@@ -70,7 +70,11 @@ pub struct SageApp {
     tasks: Vec<TaskCard>,
     last_request: String,
     egui_ctx: egui::Context,
-    notices: Vec<String>,
+    /// Avisos flutuantes (somem sozinhos depois de alguns segundos ou com um clique).
+    notices: Vec<(String, std::time::Instant)>,
+    /// Imagens coladas (Ctrl+V) esperando o envio: caminho do PNG e miniatura.
+    attachments: Vec<(std::path::PathBuf, egui::TextureHandle)>,
+    health_written: bool,
     confirm: Option<(String, String)>,
     runs: Vec<(String, String, String)>,
     pet: sage_avatar::PetView,
@@ -140,6 +144,8 @@ impl SageApp {
             last_request: String::new(),
             egui_ctx: cc.egui_ctx.clone(),
             notices: vec![],
+            attachments: vec![],
+            health_written: false,
             confirm: None,
             runs: load_runs(),
             pet,
@@ -188,6 +194,7 @@ impl SageApp {
                 SageEvent::Reply { full, spoken, .. } => {
                     self.push(false, if full.trim().is_empty() { spoken } else { full });
                     self.live.remove("lead");
+                    self.live.remove("chat");
                 }
                 SageEvent::Stream { source, text, .. } => {
                     let running = self.tasks.iter_mut().rev().find(|t| t.done.is_none());
@@ -205,7 +212,7 @@ impl SageApp {
                         buf.drain(..cut);
                     }
                 }
-                SageEvent::PlanReady { run_id, playbook, why, .. } => {
+                SageEvent::PlanReady { run_id, title, playbook, why, .. } => {
                     let pending_live = self.live.remove("lead").unwrap_or_default();
                     self.live.clear();
                     if let Some(t) = self.tasks.iter_mut().find(|t| t.run_id == run_id) {
@@ -220,7 +227,7 @@ impl SageApp {
                         }
                         self.tasks.push(TaskCard {
                             run_id,
-                            title: task_title(&self.last_request),
+                            title: if title.trim().is_empty() { task_title(&self.last_request) } else { title },
                             playbook,
                             why,
                             when: chrono::Local::now().format("%H:%M").to_string(),
@@ -264,15 +271,19 @@ impl SageApp {
                     }
                 }
                 SageEvent::ProviderSwitch { from, to, reason } => {
-                    self.notices.push(format!("Trocando {from} por {to}: {reason}"));
+                    self.notices.push((format!("Trocando {from} por {to}: {reason}"), std::time::Instant::now()));
                 }
                 SageEvent::ConfirmRequest { id, question } => self.confirm = Some((id, question)),
-                SageEvent::Notice { text } => self.notices.push(text),
+                SageEvent::Notice { text } => {
+                    // O mesmo aviso repetido só renova o tempo.
+                    self.notices.retain(|(t, _)| *t != text);
+                    self.notices.push((text, std::time::Instant::now()));
+                }
                 _ => {}
             }
         }
-        if self.notices.len() > 4 {
-            let n = self.notices.len() - 4;
+        if self.notices.len() > 3 {
+            let n = self.notices.len() - 3;
             self.notices.drain(..n);
         }
     }
@@ -327,12 +338,51 @@ impl SageApp {
 
     fn send_input(&mut self) {
         let text = self.input.trim().to_string();
-        if text.is_empty() {
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
         self.input.clear();
-        self.push(true, text.clone());
-        self.rt.ask(text, false);
+        let images: Vec<String> = self.attachments.drain(..).map(|(p, _)| p.display().to_string()).collect();
+        let shown = match images.len() {
+            0 => text.clone(),
+            1 => format!("{text}
+
+_🖼 1 imagem anexada_").trim().to_string(),
+            n => format!("{text}
+
+_🖼 {n} imagens anexadas_").trim().to_string(),
+        };
+        self.push(true, shown);
+        self.rt.ask_with_images(text, false, images);
+    }
+
+    /// Ctrl+V com imagem na área de transferência: salva em `data/attachments` e mostra a
+    /// miniatura acima da caixa de texto até o envio.
+    fn take_pasted_images(&mut self, ctx: &egui::Context) {
+        let pasted: Vec<Arc<egui::ColorImage>> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| if let egui::Event::PasteImage(img) = e { Some(img.clone()) } else { None })
+                .collect()
+        });
+        for img in pasted {
+            let [w, h] = img.size;
+            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+            let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, rgba) else { continue };
+            let dir = sage_core::paths::data().join("attachments");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join(format!("colado-{}.png", chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")));
+            match buf.save(&path) {
+                Ok(()) => {
+                    let tex = ctx.load_texture(path.display().to_string(), (*img).clone(), egui::TextureOptions::LINEAR);
+                    self.attachments.push((path, tex));
+                    if self.attachments.len() > 4 {
+                        self.attachments.remove(0);
+                    }
+                }
+                Err(e) => self.notices.push((format!("Não consegui salvar a imagem colada: {e}"), std::time::Instant::now())),
+            }
+        }
     }
 
     // ------------------------------------------------------------------ top bar
@@ -548,13 +598,6 @@ impl SageApp {
 
     fn composer(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
-        for n in &self.notices {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                theme::badge(ui, p.accent, "Aviso");
-                ui.label(RichText::new(n).size(13.0).color(p.muted));
-            });
-        }
         if let Some((id, q)) = self.confirm.clone() {
             theme::card(ui).stroke(Stroke::new(1.0, p.warn)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -575,6 +618,27 @@ impl SageApp {
                 });
             });
             ui.add_space(8.0);
+        }
+        if !self.attachments.is_empty() {
+            let mut remove: Option<usize> = None;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for (i, (_, tex)) in self.attachments.iter().enumerate() {
+                    let size = tex.size_vec2();
+                    let scale = (64.0 / size.y.max(1.0)).min(120.0 / size.x.max(1.0));
+                    let r = ui
+                        .add(egui::Image::new(tex).fit_to_exact_size(size * scale).corner_radius(8).sense(egui::Sense::click()))
+                        .on_hover_text("Clique para tirar esta imagem");
+                    if r.clicked() {
+                        remove = Some(i);
+                    }
+                }
+                ui.label(RichText::new("Imagem anexada; Enter envia").size(12.5).color(p.muted));
+            });
+            if let Some(i) = remove {
+                self.attachments.remove(i);
+            }
+            ui.add_space(6.0);
         }
         let input_id = egui::Id::unique("composer-input");
         let focus = ui.ctx().memory(|m| m.focused()) == Some(input_id);
@@ -611,7 +675,7 @@ impl SageApp {
                         self.mic_from_button = true;
                     }
                     let send_w = 46.0;
-                    let hint = if self.mic_held { "Ouvindo… solte o botão para enviar" } else { "Mensagem para o S.A.G.E." };
+                    let hint = if self.mic_held { "Ouvindo… solte o botão para enviar" } else { "Mensagem para o S.A.G.E. (Ctrl+V cola imagens)" };
                     let edit = egui::TextEdit::multiline(&mut self.input)
                         .id(input_id)
                         .desired_rows(1)
@@ -630,7 +694,7 @@ impl SageApp {
                         resp.request_focus();
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let can = !self.input.trim().is_empty();
+                        let can = !self.input.trim().is_empty() || !self.attachments.is_empty();
                         let send = ui
                             .add_enabled_ui(can, |ui| theme::icon_button(ui, theme::Kind::Primary, theme::Icon::Send, "Enviar (Enter)", 38.0))
                             .inner;
@@ -703,7 +767,7 @@ impl SageApp {
                     task_body(ui, &p, t);
                 });
             }
-            if let Some(text) = self.live.get("lead").filter(|t| !t.trim().is_empty()) {
+            if let Some(text) = self.live.get("chat").or_else(|| self.live.get("lead")).filter(|t| !t.trim().is_empty()) {
                 ui.add_space(4.0);
                 theme::disclosure(ui, egui::Id::unique("live-lead"), false, theme::RowStatus::Busy, "Pensando…", "lead", false, |ui| {
                     live_box(ui, &p, text);
@@ -922,6 +986,11 @@ fn suggestion_card(ui: &mut egui::Ui, p: &Palette, tag: &str, text: &str, w: f32
 impl eframe::App for SageApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.health_written {
+            // Primeiro quadro desenhado: avisa o script de reinício que abri de verdade.
+            crate::runtime::write_health();
+            self.health_written = true;
+        }
         self.drain_events();
         self.poll_os(&ctx);
         // Sempre chamado: ligar/desligar toca a entrada/saída do slime até o fim.
@@ -935,6 +1004,10 @@ impl eframe::App for SageApp {
         }
         self.top_bar(ui);
         let p = theme::palette(ui);
+        self.toasts(&ctx, &p);
+        if self.page == Page::Chat {
+            self.take_pasted_images(&ctx);
+        }
         match self.page {
             Page::Chat => self.chat_page(ui),
             Page::Runs => {
@@ -958,6 +1031,56 @@ impl eframe::App for SageApp {
                     });
             }
         }
+    }
+}
+
+/// Quanto tempo um aviso fica na tela.
+const TOAST_SECS: f32 = 6.0;
+
+impl SageApp {
+    /// Avisos flutuantes no canto, por cima de tudo, sem empurrar o chat: somem sozinhos
+    /// em alguns segundos e um clique fecha na hora.
+    fn toasts(&mut self, ctx: &egui::Context, p: &Palette) {
+        self.notices.retain(|(_, at)| at.elapsed().as_secs_f32() < TOAST_SECS);
+        if self.notices.is_empty() {
+            return;
+        }
+        let mut close: Option<usize> = None;
+        egui::Area::new(egui::Id::unique("toasts"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 64.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                for (i, (text, at)) in self.notices.iter().enumerate() {
+                    let left = TOAST_SECS - at.elapsed().as_secs_f32();
+                    let alpha = left.clamp(0.0, 0.6) / 0.6;
+                    ui.set_opacity(alpha);
+                    let r = egui::Frame::new()
+                        .fill(p.raised)
+                        .stroke(Stroke::new(1.0, p.border))
+                        .corner_radius(CornerRadius::same(theme::RADIUS_LG))
+                        .inner_margin(Margin::symmetric(12, 8))
+                        .shadow(theme::soft_shadow(p))
+                        .show(ui, |ui| {
+                            ui.set_max_width(320.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                theme::badge(ui, p.accent, "Aviso");
+                                ui.label(RichText::new(text).size(13.0).color(p.text));
+                            });
+                        })
+                        .response
+                        .interact(egui::Sense::click())
+                        .on_hover_text("Clique para fechar");
+                    if r.clicked() {
+                        close = Some(i);
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        if let Some(i) = close {
+            self.notices.remove(i);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 

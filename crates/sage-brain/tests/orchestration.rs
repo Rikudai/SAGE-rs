@@ -337,8 +337,8 @@ async fn rate_limit_moves_workers_to_the_next_provider() {
         |e| matches!(e, SageEvent::ProviderSwitch { from, to, .. } if from == "gemini" && to == "groq")
     ));
     assert_eq!(report.switches.len(), 1);
-    assert!(h.brain.quota().read(|q| q.usage_pct("gemini", chrono::Utc::now())) >= 100.0);
-    assert!(h.data.join("quota.json").exists());
+    // Só o modelo que bateu no limite descansa; o Gemini segue livre para os outros modelos.
+    assert_eq!(h.brain.quota().read(|q| q.usage_pct("gemini", chrono::Utc::now())), 0.0);
     let _ = std::fs::remove_dir_all(&h.data);
 }
 
@@ -402,7 +402,7 @@ async fn run_loop_confirms_a_risky_action() {
     let mut rx = h.bus.subscribe();
     let (tx, cmd_rx) = mpsc::channel(8);
     let task = tokio::spawn(h.brain.clone().run(cmd_rx));
-    tx.send(Command::Ask { text: "desliga o pc".into(), from_voice: true }).await.unwrap();
+    tx.send(Command::Ask { text: "desliga o pc".into(), from_voice: true, images: vec![] }).await.unwrap();
     let spoken = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match rx.recv().await {
@@ -430,7 +430,7 @@ async fn stop_run_cancels_a_running_worker() {
     let mut rx = h.bus.subscribe();
     let (tx, cmd_rx) = mpsc::channel(8);
     let task = tokio::spawn(h.brain.clone().run(cmd_rx));
-    tx.send(Command::Ask { text: "leia tudo".into(), from_voice: false }).await.unwrap();
+    tx.send(Command::Ask { text: "leia tudo".into(), from_voice: false, images: vec![] }).await.unwrap();
     let (spoken, path) = tokio::time::timeout(Duration::from_secs(10), async {
         let mut path = String::new();
         loop {
@@ -455,5 +455,31 @@ async fn stop_run_cancels_a_running_worker() {
     assert!(!report.workers().any(|w| w.used));
     drop(tx);
     task.await.unwrap();
+    let _ = std::fs::remove_dir_all(&h.data);
+}
+
+#[tokio::test]
+async fn background_task_frees_the_chat_and_replies_later() {
+    let h = harness(&["gemini", "groq"], script(TRIAGE_TASK, "plan-big-execute-small", PLAN_ONE, ok_gate(), None));
+    h.brain.enable_background_tasks();
+    let mut rx = h.bus.subscribe();
+    let out = h.brain.ask("Ache a main do projeto", false).await;
+    assert!(out.background);
+    assert!(out.report.is_none());
+    assert!(!h.brain.is_busy(), "o chat fica livre enquanto a tarefa roda");
+    // O resultado chega depois, numa Reply própria, com o título curto no PlanReady.
+    let mut got_reply = false;
+    let mut title = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline && !got_reply {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(SageEvent::PlanReady { title: t, .. })) => title = t,
+            Ok(Ok(SageEvent::Reply { full, .. })) if full.contains("main") || full.contains("Achei") => got_reply = true,
+            _ => {}
+        }
+    }
+    assert!(got_reply, "a tarefa respondeu em segundo plano");
+    assert!(!title.is_empty());
+    assert!(h.brain.background_tasks().is_empty());
     let _ = std::fs::remove_dir_all(&h.data);
 }

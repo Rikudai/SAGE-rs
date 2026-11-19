@@ -16,3 +16,8 @@ data/memory/
 data/pet_mood.json
 data/ultima_atualizacao.json
 .claude/settings.local.json
+/sage.new.exe
+data/attachments/
+data/saude.json
+data/resultado_atualizacao.json
+data/atualizacao_pendente.json

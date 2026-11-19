@@ -20,6 +20,8 @@ const DEFAULT_API_COOLDOWN_SECS: i64 = 15 * 60;
 const DEFAULT_CLI_COOLDOWN_SECS: i64 = 60 * 60;
 /// Longest cool-down we accept from a hint.
 const MAX_COOLDOWN_SECS: i64 = 30 * 86_400;
+/// Maior descanso de um modelo de API (a cota diária do Gemini volta em até um dia).
+const MAX_MODEL_REST_SECS: i64 = 86_400;
 /// Usage records without a reset time are forgotten after this long.
 const STALE_AFTER_HOURS: i64 = 24;
 
@@ -283,11 +285,42 @@ fn parse_clock(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
 pub struct SharedQuota {
     ledger: Arc<Mutex<QuotaLedger>>,
     path: Option<PathBuf>,
+    /// Modelos de API em descanso até a hora indicada (chave: `ModelRef::label`).
+    models: Arc<Mutex<BTreeMap<String, DateTime<Utc>>>>,
 }
 
 impl SharedQuota {
     pub fn new(ledger: QuotaLedger, path: Option<PathBuf>) -> Self {
-        Self { ledger: Arc::new(Mutex::new(ledger)), path }
+        Self { ledger: Arc::new(Mutex::new(ledger)), path, models: Arc::default() }
+    }
+
+    /// Limite de uma API de modelo: as cotas do Gemini, do Groq e do OpenRouter são por
+    /// modelo, então só esse modelo descansa; o provedor segue livre para os outros.
+    /// "Request too large" não é cota (o pedido é que é grande): só pula o modelo.
+    /// True quando o erro foi de limite.
+    pub fn observe_model_error(&self, m: &ModelRef, err: &LlmError) -> bool {
+        let LlmError::RateLimited { detail, retry_after_secs, .. } = err else {
+            return false;
+        };
+        if detail.to_ascii_lowercase().contains("too large") {
+            return true;
+        }
+        let now = Utc::now();
+        let resets = retry_after_secs
+            .map(|s| now + seconds(i64::try_from(s).unwrap_or(MAX_MODEL_REST_SECS)))
+            .or_else(|| parse_reset_hint(detail, now))
+            .unwrap_or_else(|| now + seconds(DEFAULT_API_COOLDOWN_SECS))
+            .min(now + seconds(MAX_MODEL_REST_SECS));
+        lock(&self.models).insert(model_key(m), resets);
+        true
+    }
+
+    /// O modelo está descansando depois de um limite de cota.
+    pub fn model_resting(&self, m: &ModelRef) -> bool {
+        let now = Utc::now();
+        let mut map = lock(&self.models);
+        map.retain(|_, until| *until > now);
+        map.contains_key(&model_key(m))
     }
 
     /// Loads `path` (empty when missing) and saves back to it.
@@ -329,6 +362,15 @@ impl SharedQuota {
     }
 }
 
+fn model_key(m: &ModelRef) -> String {
+    format!("{}:{}", m.provider, m.model)
+}
+
+/// Provedores de API de modelo: o limite deles vale por modelo, não pelo provedor.
+pub fn is_api_provider(provider: &str) -> bool {
+    !crate::playbooks::is_cli_provider(provider)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +382,22 @@ mod tests {
 
     fn refs(ps: &[&str]) -> Vec<ModelRef> {
         ps.iter().map(|p| ModelRef::new(*p, "m")).collect()
+    }
+
+    #[test]
+    fn api_rate_limit_rests_only_that_model() {
+        let q = SharedQuota::new(QuotaLedger::default(), None);
+        let a = ModelRef::new("gemini", "gemini-a");
+        let b = ModelRef::new("gemini", "gemini-b");
+        let err = LlmError::RateLimited { provider: "gemini".into(), detail: "429".into(), retry_after_secs: Some(600) };
+        assert!(q.observe_model_error(&a, &err));
+        assert!(q.model_resting(&a));
+        assert!(!q.model_resting(&b));
+        assert_eq!(q.read(|l| l.usage_pct("gemini", Utc::now())), 0.0);
+        let big = LlmError::RateLimited { provider: "groq".into(), detail: "Request too large for model".into(), retry_after_secs: None };
+        let g = ModelRef::new("groq", "qwen");
+        assert!(q.observe_model_error(&g, &big));
+        assert!(!q.model_resting(&g));
     }
 
     #[test]

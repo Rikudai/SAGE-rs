@@ -3,6 +3,7 @@
 mod args;
 pub mod memory;
 pub mod skills;
+pub mod selfedit;
 pub mod update;
 mod files;
 mod keys;

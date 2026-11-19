@@ -56,7 +56,7 @@ fn no_window(cmd: &mut tokio::process::Command) {
 }
 
 /// Roda um programa e devolve a saída (stdout) ou a última linha do erro.
-async fn run(exe: &Path, args: &[&str], cwd: &Path, timeout: Duration, path_extra: &[PathBuf]) -> Result<String, String> {
+pub(crate) async fn run(exe: &Path, args: &[&str], cwd: &Path, timeout: Duration, path_extra: &[PathBuf]) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.args(args).current_dir(cwd).stdin(std::process::Stdio::null()).kill_on_drop(true);
     if !path_extra.is_empty() {
@@ -99,7 +99,7 @@ fn git_exe() -> PathBuf {
     which::which("git").unwrap_or_else(|_| PathBuf::from("git"))
 }
 
-async fn git(root: &Path, args: &[&str], timeout_secs: u64) -> Result<String, String> {
+pub(crate) async fn git(root: &Path, args: &[&str], timeout_secs: u64) -> Result<String, String> {
     run(&git_exe(), args, root, Duration::from_secs(timeout_secs), &[]).await
 }
 
@@ -108,7 +108,7 @@ fn home() -> Option<PathBuf> {
 }
 
 /// O `cargo` e as pastas que o build precisa no PATH (o toolchain gnu usa o MinGW).
-fn cargo_env() -> Option<(PathBuf, Vec<PathBuf>)> {
+pub(crate) fn cargo_env() -> Option<(PathBuf, Vec<PathBuf>)> {
     let mut extra = Vec::new();
     for p in [PathBuf::from(r"C:\mingw64\bin"), PathBuf::from(r"C:\msys64\mingw64\bin")] {
         if p.is_dir() {
@@ -337,7 +337,7 @@ static KEY_SHAPES: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Valores que parecem chaves no `config/config.json` (as chaves reais deste PC).
-fn configured_secrets(root: &Path) -> Vec<String> {
+pub(crate) fn configured_secrets(root: &Path) -> Vec<String> {
     fn walk(v: &Value, key: &str, out: &mut Vec<String>) {
         match v {
             Value::Object(m) => m.iter().for_each(|(k, v)| walk(v, k, out)),

@@ -103,6 +103,12 @@ impl Runtime {
             Arc::new(sage_tools::memory::MemoryTools(memory.clone())),
             Arc::new(sage_tools::skills::SkillTools(skills)),
             Arc::new(sage_tools::update::UpdateTools { root: sage_core::paths::root().to_path_buf() }),
+            // Auto-edição: muda o próprio código numa cópia, testa, aplica e reinicia.
+            Arc::new(sage_tools::selfedit::SelfEdit::new(
+                sage_core::paths::root().to_path_buf(),
+                swap_hub.clone() as Arc<dyn ModelHub>,
+                bus.clone(),
+            )),
         ];
         let pc: Arc<dyn Toolbox> = Arc::new(sage_tools::PcToolbox::new(&snapshot));
         let swap_tools = Arc::new(SwapTools(RwLock::new(Arc::new(SageTools { pc, extra: extra.clone() }))));
@@ -116,6 +122,8 @@ impl Runtime {
             let mem: Arc<dyn sage_core::MemoryHook> = memory.clone();
             sage_brain::Brain::new_with_memory(cfg.clone(), hub, tools, bus.clone(), Some(mem))?
         };
+        // Tarefas longas vão para o segundo plano; o chat segue respondendo.
+        brain.enable_background_tasks();
         rt.spawn(brain.run(rx));
 
         // Fala as respostas e toca os sons de evento.
@@ -139,6 +147,7 @@ impl Runtime {
         }
 
         startup_update(&rt, &snapshot, bus.clone());
+        announce_updates(&rt, bus.clone());
 
         Ok(Self { rt, bus, cmd: tx, voice, hub: swap_hub, tools: swap_tools, memory, extra })
     }
@@ -160,9 +169,14 @@ impl Runtime {
     }
 
     pub fn ask(&self, text: String, from_voice: bool) {
+        self.ask_with_images(text, from_voice, Vec::new());
+    }
+
+    /// Pedido com imagens coladas no chat (caminhos de PNG).
+    pub fn ask_with_images(&self, text: String, from_voice: bool, images: Vec<String>) {
         let tx = self.cmd.clone();
         self.rt.spawn(async move {
-            let _ = tx.send(Command::Ask { text, from_voice }).await;
+            let _ = tx.send(Command::Ask { text, from_voice, images }).await;
         });
     }
 
@@ -186,7 +200,7 @@ impl Runtime {
         self.rt.spawn(async move {
             match voice.finish_listening().await {
                 Ok(text) if !text.trim().is_empty() => {
-                    let _ = tx.send(Command::Ask { text, from_voice: true }).await;
+                    let _ = tx.send(Command::Ask { text, from_voice: true, images: vec![] }).await;
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("voz: {e:#}"),
@@ -238,4 +252,72 @@ fn startup_update(rt: &tokio::runtime::Runtime, cfg: &Config, bus: EventBus) {
         };
         bus.emit(SageEvent::Notice { text });
     });
+}
+
+/// Avisa o resultado do `scripts/reiniciar-atualizado.ps1` ("Estou atualizado..."): olha o
+/// `data/resultado_atualizacao.json` ao abrir e de tempos em tempos (o script também grava
+/// ali quando a compilação falha com o S.A.G.E. ainda aberto).
+fn announce_updates(rt: &tokio::runtime::Runtime, bus: EventBus) {
+    let path = sage_core::paths::data().join("resultado_atualizacao.json");
+    rt.spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        loop {
+            if let Some(text) = take_update_result(&path) {
+                sage_tools::update::log_line(sage_core::paths::root(), &format!("[anúncio] {text}"));
+                bus.emit(SageEvent::Reply { spoken: text.clone(), full: text, emotion: Some("feliz".into()) });
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
+}
+
+/// Lê o resultado ainda não anunciado e marca como anunciado.
+pub fn take_update_result(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut v: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}')).ok()?;
+    if v.get("anunciado").and_then(serde_json::Value::as_bool).unwrap_or(true) {
+        return None;
+    }
+    v["anunciado"] = serde_json::Value::Bool(true);
+    let _ = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default());
+    let get = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
+    let (status, resumo, testes, commit) = (get("status"), get("resumo"), get("testes"), get("commit"));
+    let mut extra = String::new();
+    if !resumo.is_empty() {
+        extra.push_str(&format!(" {}.", resumo.trim_end_matches('.')));
+    }
+    if !testes.is_empty() {
+        extra.push_str(&format!(" Testes: {testes}."));
+    }
+    let versao = if commit.is_empty() { String::new() } else { format!(" ({commit})") };
+    Some(match status.as_str() {
+        "atualizado" => format!("Estou atualizado e rodando a versão nova{versao}.{extra}"),
+        "revertido" => format!("A versão nova não abriu direito, então voltei para a anterior.{extra} Os detalhes estão em logs/atualizacao.log."),
+        "falhou_build" => format!("Não me atualizei: a compilação falhou e continuo na versão atual.{extra}"),
+        _ => format!("A atualização não terminou bem ({status}).{extra} Veja logs/atualizacao.log."),
+    })
+}
+
+/// O S.A.G.E. abriu de verdade: o script de reinício espera por este arquivo (com o pid).
+pub fn write_health() {
+    let v = serde_json::json!({ "pid": std::process::id(), "at": chrono::Local::now().to_rfc3339() });
+    let _ = std::fs::write(sage_core::paths::data().join("saude.json"), v.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn announces_each_update_result_once() {
+        let dir = std::env::temp_dir().join(format!("sage-anuncio-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("resultado_atualizacao.json");
+        let body = "\u{feff}{\"status\":\"atualizado\",\"resumo\":\"Voz local\",\"testes\":\"200 testes passaram\",\"commit\":\"abc1234\",\"anunciado\":false}";
+        std::fs::write(&p, body).unwrap();
+        let t = take_update_result(&p).expect("anúncio");
+        assert!(t.starts_with("Estou atualizado") && t.contains("Voz local") && t.contains("200 testes passaram"), "{t}");
+        assert!(take_update_result(&p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -445,7 +445,11 @@ pub async fn run_api_worker(env: &WorkerEnv, job: ApiJob) -> WorkerRun {
                 return ended(o, &model, tool_calls);
             }
             Ok(Err(e)) => {
-                let limited = env.quota.observe_error(&e).is_some();
+                let limited = if crate::quota::is_api_provider(&mref.provider) {
+                    env.quota.observe_model_error(mref, &e)
+                } else {
+                    env.quota.observe_error(&e).is_some()
+                };
                 if e.is_transient()
                     && let Some((next, _)) = job.models.get(idx + 1)
                 {

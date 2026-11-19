@@ -29,7 +29,7 @@ pub enum SageEvent {
     /// Live tokens of the lead or a worker (`source` = "lead" or worker id).
     Stream { source: String, text: String, thought: bool },
     /// The lead picked a playbook and wrote a plan.
-    PlanReady { run_id: String, playbook: String, why: String, units: Vec<String> },
+    PlanReady { run_id: String, #[serde(default)] title: String, playbook: String, why: String, units: Vec<String> },
     WorkerStart { run_id: String, worker: String, role: String, model: String, tier: Tier, brief: String },
     WorkerTool { worker: String, tool: String, args: String, ok: bool },
     WorkerEnd { run_id: String, worker: String, status: WorkerStatus, summary: String, usage: Usage },
@@ -50,7 +50,13 @@ pub enum SageEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Command {
-    Ask { text: String, from_voice: bool },
+    Ask {
+        text: String,
+        from_voice: bool,
+        /// Imagens coladas no chat (PNG salvo em disco), enviadas junto com o pedido.
+        #[serde(default)]
+        images: Vec<String>,
+    },
     Confirm { id: String, yes: bool },
     StopRun,
     ReloadConfig,

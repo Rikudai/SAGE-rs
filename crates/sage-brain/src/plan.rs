@@ -17,6 +17,9 @@ pub struct PlaybookChoice {
     pub playbook: String,
     #[serde(default)]
     pub why: String,
+    /// Título curto da tarefa para o painel (2 a 5 palavras).
+    #[serde(default)]
+    pub title: String,
 }
 
 /// Which executor a unit needs.

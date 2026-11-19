@@ -47,7 +47,7 @@ pub fn pick_prompt(request: &str, pb: &Playbooks) -> String {
     format!(
         "{PICK_MARKER}\nPEDIDO DO USUÁRIO:\n{}\n\n{}\n\
 Pedido pequeno e claro: use \"direct\" (você mesmo resolve com ferramentas).\n\
-Responda só com JSON: {{\"playbook\": \"<id>\", \"why\": \"<uma frase em português>\"}}",
+Responda só com JSON: {{\"playbook\": \"<id>\", \"why\": \"<uma frase em português>\", \"title\": \"<título curto da tarefa, 2 a 5 palavras, sem copiar o pedido>\"}}",
         request.trim(),
         pb.pick_menu()
     )

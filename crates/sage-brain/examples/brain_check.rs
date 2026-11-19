@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     let pedidos: Vec<String> = std::env::args().skip(1).collect();
     for p in pedidos {
         println!("\n=== PEDIDO: {p}");
-        tx.send(Command::Ask { text: p, from_voice: false }).await?;
+        tx.send(Command::Ask { text: p, from_voice: false, images: vec![] }).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(420);
         loop {
             let ev = match tokio::time::timeout_at(deadline, sub.recv()).await {

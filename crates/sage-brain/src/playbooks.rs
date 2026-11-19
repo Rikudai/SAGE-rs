@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(pb.providers, ["gemini", "groq", "claude", "agy", "codex"]);
         assert!(pb.principles.len() >= 10);
         assert_eq!(pb.lead[0], ModelRef { provider: "gemini".into(), model: "gemini-4-hydrogen".into(), effort: Some("high".into()) });
-        assert_eq!(pb.triage[0].provider, "groq");
+        assert_eq!(pb.triage[0].provider, "gemini");
         assert_eq!(pb.pick_order.len(), 11);
         for id in [
             "complete",
